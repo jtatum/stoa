@@ -20,7 +20,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tests.fixtures.discovery import (
     COMMENT,
     MECHANISMS,
-    REPLY_POST,
     build_discovery_scenario,
     surface_dashboard,
     surface_feed,
@@ -71,14 +70,6 @@ async def test_unread_cursor_surfaces_every_mechanism(client: AsyncClient) -> No
     assert await surface_unread(client, scenario) == MECHANISMS
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "issue #64: replies_to_me selects Post rows by parent_post_id, and "
-        "comments live in a separate table, so no comment can enter the "
-        "digest regardless of timing or watermark."
-    ),
-)
 async def test_dashboard_surfaces_every_mechanism(client: AsyncClient) -> None:
     scenario = await build_discovery_scenario(client)
     assert await surface_dashboard(client, scenario) == MECHANISMS
@@ -124,4 +115,4 @@ async def test_blindness_runs_in_both_directions(client: AsyncClient, db: AsyncS
 
     assert await surface_thread(client, scenario) == {COMMENT}
     assert await surface_notifications(db, scenario) == MECHANISMS
-    assert await surface_dashboard(client, scenario) == {REPLY_POST}
+    assert await surface_dashboard(client, scenario) == MECHANISMS
