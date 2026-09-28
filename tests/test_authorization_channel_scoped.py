@@ -207,6 +207,91 @@ async def test_unscoped_post_comment_remains_public(client: AsyncClient):
 
 
 # ---------------------------------------------------------------------------
+# Issue #136 — GET /api/posts/{post_id}/comments (channel-scoped)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_non_member_cannot_list_channel_scoped_comments(client: AsyncClient):
+    """A non-member cannot read existing comments on a channel-scoped post."""
+    _, channel_id = await _alice_group_channel(client)
+
+    resp = await client.post(
+        "/api/posts",
+        json={
+            "subject": "Scoped post",
+            "body_markdown": "Private scoped post body.",
+            "channel_id": channel_id,
+        },
+        headers=ALICE_HEADERS,
+    )
+    assert resp.status_code == 201
+    post_id = resp.json()["id"]
+
+    resp = await client.post(
+        f"/api/posts/{post_id}/comments",
+        json={"body_markdown": "Private member comment."},
+        headers=ALICE_HEADERS,
+    )
+    assert resp.status_code == 201
+
+    resp = await client.get(f"/api/posts/{post_id}/comments", headers=BOB_HEADERS)
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_member_can_list_channel_scoped_comments(client: AsyncClient):
+    """A group member can still read comment bodies on a channel-scoped post."""
+    _, channel_id = await _alice_group_channel(client)
+
+    resp = await client.post(
+        "/api/posts",
+        json={
+            "subject": "Scoped post",
+            "body_markdown": "Private scoped post body.",
+            "channel_id": channel_id,
+        },
+        headers=ALICE_HEADERS,
+    )
+    assert resp.status_code == 201
+    post_id = resp.json()["id"]
+
+    resp = await client.post(
+        f"/api/posts/{post_id}/comments",
+        json={"body_markdown": "Private member comment."},
+        headers=ALICE_HEADERS,
+    )
+    assert resp.status_code == 201
+
+    resp = await client.get(f"/api/posts/{post_id}/comments", headers=ALICE_HEADERS)
+    assert resp.status_code == 200
+    assert [comment["body_markdown"] for comment in resp.json()] == ["Private member comment."]
+
+
+@pytest.mark.asyncio
+async def test_unscoped_post_comments_remain_public(client: AsyncClient):
+    """Regression: Bob can read Alice's comments on an unscoped post."""
+    resp = await client.post(
+        "/api/posts",
+        json={"subject": "Public post", "body_markdown": "Everyone can read this."},
+        headers=ALICE_HEADERS,
+    )
+    assert resp.status_code == 201
+    post_id = resp.json()["id"]
+
+    resp = await client.post(
+        f"/api/posts/{post_id}/comments",
+        json={"body_markdown": "Public comment."},
+        headers=ALICE_HEADERS,
+    )
+    assert resp.status_code == 201
+
+    resp = await client.get(f"/api/posts/{post_id}/comments", headers=BOB_HEADERS)
+    assert resp.status_code == 200
+    assert [comment["body_markdown"] for comment in resp.json()] == ["Public comment."]
+
+
+# ---------------------------------------------------------------------------
 # Issue #49 — parent_post_id / parent_id validation on post creation
 # ---------------------------------------------------------------------------
 
