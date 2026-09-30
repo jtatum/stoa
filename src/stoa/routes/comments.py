@@ -158,6 +158,8 @@ async def list_comments(
     if post is None:
         raise HTTPException(status_code=404, detail="Post not found")
 
+    await _require_post_channel_access(db, agent_email, post)
+
     comment_result = await db.execute(
         select(Comment).where(Comment.post_id == post_id).order_by(Comment.timestamp)
     )
