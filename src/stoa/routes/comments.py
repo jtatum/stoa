@@ -19,49 +19,11 @@ from stoa.services.close_votes import (
 )
 from stoa.services.mentions import store_mentions
 from stoa.services.notifications import notify_comment
+from stoa.services.post_access import require_post_access
 from stoa.services.threads import build_comment_tree
 
 router = APIRouter(prefix="/api/posts/{post_id}/comments", tags=["comments"])
 thread_router = APIRouter(prefix="/api/posts/{post_id}", tags=["comments"])
-
-
-async def _require_post_channel_access(db: AsyncSession, agent_email: str, post: Post) -> None:
-    """Verify the caller may interact with a channel-scoped post.
-
-    If *post* has a ``channel_id``, resolve the channel's ``group_id`` and
-    confirm the agent is a member.  Unscoped posts (``channel_id is None``)
-    remain public and are skipped.
-
-    Mirrors ``_require_channel_access`` in ``posts.py`` (PR #45) so the
-    comment-side cannot be used to interact with private channel posts.
-    """
-    if post.channel_id is None:
-        return
-
-    from stoa.models import Agent, Channel, Membership
-
-    channel = (
-        await db.execute(select(Channel).where(Channel.id == post.channel_id))
-    ).scalar_one_or_none()
-    if channel is None:
-        raise HTTPException(status_code=404, detail="Channel not found")
-
-    agent = (
-        await db.execute(select(Agent).where(Agent.agent_email == agent_email))
-    ).scalar_one_or_none()
-    if agent is None:
-        raise HTTPException(status_code=401, detail="Agent not found")
-
-    membership = (
-        await db.execute(
-            select(Membership).where(
-                Membership.agent_id == agent.id,
-                Membership.group_id == channel.group_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if membership is None:
-        raise HTTPException(status_code=403, detail="Not a member of this channel's group")
 
 
 async def enforce_soft_close_acknowledgement(
@@ -168,7 +130,7 @@ async def create_comment(
         raise HTTPException(status_code=404, detail="Post not found")
 
     # Authorization: channel-scoped posts require group membership (issue #47).
-    await _require_post_channel_access(db, agent_email, post)
+    await require_post_access(db, agent_email, post, include_deleted=True)
 
     # Shared write gate (issues #116/#153): hard-status door plus the
     # soft-close acknowledgement pin, resolved at the thread root so
@@ -265,7 +227,7 @@ async def list_comments(
     if post is None:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    await _require_post_channel_access(db, agent_email, post)
+    await require_post_access(db, agent_email, post)
 
     comment_result = await db.execute(
         select(Comment).where(Comment.post_id == post_id).order_by(Comment.timestamp)
@@ -286,7 +248,7 @@ async def delete_comment(
     agent_email: str = Depends(get_current_agent_or_session),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Delete a comment. Only the original author can delete."""
+    """Delete a comment. The original author must still have access to its post."""
     result = await db.execute(
         select(Comment).where(Comment.id == comment_id, Comment.post_id == post_id)
     )
@@ -295,6 +257,11 @@ async def delete_comment(
         raise HTTPException(status_code=404, detail="Comment not found")
     if comment.author != agent_email:
         raise HTTPException(status_code=403, detail="Can only delete your own comments")
+
+    post = await db.get(Post, post_id)
+    if post is None:
+        raise HTTPException(status_code=404, detail="Post not found")
+    await require_post_access(db, agent_email, post)
 
     await db.delete(comment)
 
@@ -317,7 +284,7 @@ async def get_thread(
         raise HTTPException(status_code=404, detail="Post not found")
 
     # Authorization: same channel-scope check as other comment endpoints.
-    await _require_post_channel_access(db, agent_email, post)
+    await require_post_access(db, agent_email, post)
 
     comment_result = await db.execute(
         select(Comment).where(Comment.post_id == post_id).order_by(Comment.timestamp)
