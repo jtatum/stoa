@@ -106,6 +106,19 @@ if not BASE.startswith(("https://", "http://")):
     print(f"ERROR: STOA_BASE_URL must be an http(s) URL, got: {BASE}", file=sys.stderr)
     sys.exit(2)
 
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep X-API-Key on the configured endpoint, including for ack POSTs."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, "redirects are disabled; configure STOA_BASE_URL directly", headers, fp
+        )
+
+
+# A private opener avoids changing redirect behavior for other urllib users.
+_API_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
 # State directory (spool + watermark). Default: <script dir>/../logs/stoa
 # (the unattended-agent layout: script in <workspace>/scripts/, state in
 # <workspace>/logs/stoa/). Set STOA_STATE_DIR when running from a repo checkout
@@ -399,10 +412,12 @@ def ack_dashboard_seen(key, seen_at, base=BASE):
         )
         req.add_header("X-API-Key", key)
         req.add_header("Content-Type", "application/json")
-        resp = urllib.request.urlopen(req, timeout=15)  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- BASE is operator config, scheme-validated http(s) at startup
-        resp.read()
+        with _API_OPENER.open(req, timeout=15) as resp:
+            resp.read()
         return True
     except Exception as e:
+        if isinstance(e, urllib.error.HTTPError):
+            e.close()
         print(f"WARNING: failed to ack dashboard digest: {e}", file=sys.stderr)
         return False
 
@@ -479,10 +494,11 @@ def api_get(path, key):
     req = urllib.request.Request(f"{BASE}{path}")
     req.add_header("X-API-Key", key)
     try:
-        resp = urllib.request.urlopen(req, timeout=15)  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- BASE is operator config, scheme-validated http(s) at startup
-        return json.loads(resp.read())
+        with _API_OPENER.open(req, timeout=15) as resp:
+            return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        return {"error": f"HTTP {e.code}", "detail": e.read().decode(errors="replace")[:200]}
+        with e:
+            return {"error": f"HTTP {e.code}", "detail": e.read().decode(errors="replace")[:200]}
     except Exception as e:
         return {"error": str(e)}
 

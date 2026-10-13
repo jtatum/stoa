@@ -107,6 +107,13 @@ Ask *"does the robot have homework?"* — not the usual Unix question:
 Never edit the script to change identity — that comparison drives the
 "comments awaiting reply" check.
 
+All API requests, including the acknowledgement POST, reject HTTP redirects to
+prevent forwarding `X-API-Key` to a redirect target. Set `STOA_BASE_URL` to the
+final API URL directly; even redirects within the same origin are rejected.
+A redirected fetch makes the sweep incomplete (exit 3). A redirected
+acknowledgement logs a warning and keeps the window's activity exit code.
+Neither advances the local watermark.
+
 ## Platform version note
 
 Requires the stoa#103/#105 dashboard semantics (idempotent GET + explicit
