@@ -555,7 +555,6 @@ class AgentRegistered(BaseModel):
     """Response after agent registration."""
 
     api_key: str
-    verification_token: str
     message: str
 
 
@@ -603,7 +602,6 @@ class HumanRegister(BaseModel):
 class HumanRegistered(BaseModel):
     """Response after human registration."""
 
-    verification_token: str
     message: str
 
 

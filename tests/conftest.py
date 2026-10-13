@@ -1,6 +1,7 @@
 """Shared pytest fixtures for async testing."""
 
 import secrets
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -11,6 +12,7 @@ from stoa.database import Base, get_db
 from stoa.main import app
 from stoa.models import Invite
 from stoa.rate_limit import reset_limiter
+from stoa.routes import human_ui, registration
 from stoa.routes.auth_sessions import reset_challenge_limiter
 
 from .helpers import create_test_api_key
@@ -36,6 +38,7 @@ def _reset_rate_limiter() -> None:
     """Reset rate limiter state before each test."""
     reset_limiter()
     reset_challenge_limiter()
+    human_ui.reset_verification_resend_limiter()
 
 
 @pytest.fixture(autouse=True)
@@ -63,6 +66,15 @@ async def db():
     """Provide an async database session for direct DB tests."""
     async with TestSession() as session:
         yield session
+
+
+@pytest.fixture
+def verification_email(monkeypatch):
+    """Capture the mailbox-only delivery channel, never a registration response."""
+    delivery = AsyncMock(return_value=True)
+    monkeypatch.setattr(registration, "send_verification_email", delivery)
+    monkeypatch.setattr(human_ui, "send_verification_email", delivery)
+    return delivery
 
 
 @pytest.fixture

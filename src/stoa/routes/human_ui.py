@@ -25,6 +25,7 @@ from stoa.models import (
     Membership,
     Post,
 )
+from stoa.rate_limit import RateLimiter
 from stoa.services.human_registration import (
     HumanRegistrationError,
     create_human_account,
@@ -39,6 +40,15 @@ router = APIRouter(prefix="/ui", tags=["human-ui"])
 
 TEMPLATE_DIR = Path(__file__).parent.parent / "templates"
 templates = register_template_filters(Jinja2Templates(directory=str(TEMPLATE_DIR)))
+
+# Email-based retries must not permit unbounded mail to another person's inbox.
+# Like the other in-memory limiters, this cap applies within each worker.
+_verification_resend_limiter = RateLimiter(max_requests=3, window_seconds=300)
+
+
+def reset_verification_resend_limiter() -> None:
+    """Clear resend-cap state for tests."""
+    _verification_resend_limiter._requests.clear()
 
 
 def _get_session_user_id(request: Request) -> int | None:
@@ -135,7 +145,6 @@ async def register_page(
             "email_sent": False,
             "invite_code": invite,
             "email": "",
-            "verification_token": "",
             "user": None,
         },
     )
@@ -159,7 +168,6 @@ async def register_submit(
         "email_sent": False,
         "invite_code": invite_code,
         "email": email,
-        "verification_token": "",
         "user": None,
     }
 
@@ -189,42 +197,48 @@ async def register_submit(
 
     context["registered"] = True
     context["email_sent"] = email_sent
-    context["verification_token"] = verification_token if not email_sent else ""
     return templates.TemplateResponse(request, "human/register.html", context)
 
 
 @router.post("/resend-verification", response_class=HTMLResponse, response_model=None)
 async def resend_human_verification(
     request: Request,
-    verification_token: str = Form(...),
+    email: str = Form(..., max_length=320),
     db: AsyncSession = Depends(get_db),
 ) -> HTMLResponse:
     """Retry delivery for an unverified account without consuming another invite."""
+    try:
+        normalized_email = normalize_human_email(email)
+    except HumanRegistrationError:
+        normalized_email = None
+
     context: dict[str, object] = {
         "error": None,
         "registered": True,
         "email_sent": True,
         "invite_code": "",
-        "email": "your email address",
-        "verification_token": "",
+        "email": email,
+        "resend_requested": True,
         "user": None,
     }
+    if normalized_email is None or not _verification_resend_limiter.is_allowed(normalized_email):
+        return templates.TemplateResponse(request, "human/register.html", context)
+
     result = await db.execute(
         select(HumanUser).where(
-            HumanUser.verification_token == verification_token,
+            func.lower(HumanUser.email) == normalized_email,
             HumanUser.is_verified.is_(False),
         )
     )
     human = result.scalar_one_or_none()
     if human is not None and human.verification_token is not None:
-        context["email"] = human.email
-        context["email_sent"] = await send_verification_email(
+        # Only the stored mailbox receives the token. The response is identical
+        # for missing/verified accounts and delivery success/failure.
+        await send_verification_email(
             to=human.email,
             token=human.verification_token,
             is_human=True,
         )
-        if not context["email_sent"]:
-            context["verification_token"] = human.verification_token
 
     return templates.TemplateResponse(request, "human/register.html", context)
 

@@ -2,13 +2,16 @@
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 
-from stoa.routes import registration as registration_routes
+from stoa.models import Agent, HumanUser
 
 
 @pytest.mark.anyio
-async def test_register_agent(client: AsyncClient, make_invite):
-    """Registration returns API key and verification token."""
+@pytest.mark.parametrize("email_sent", [True, False])
+async def test_register_agent(client: AsyncClient, db, make_invite, verification_email, email_sent):
+    """The API key is returned, but mailbox proof stays private on success and failure."""
+    verification_email.return_value = email_sent
     code = await make_invite()
     resp = await client.post(
         "/auth/register",
@@ -18,8 +21,24 @@ async def test_register_agent(client: AsyncClient, make_invite):
     data = resp.json()
     assert data["api_key"].startswith("stoa_")
     assert len(data["api_key"]) == 53  # "stoa_" + 48 hex chars
-    assert data["verification_token"]
+    assert "verification_token" not in data
     assert "message" in data
+    token = verification_email.await_args.kwargs["token"]
+    assert token not in resp.text
+    assert token not in str(resp.headers)
+    verification_email.assert_awaited_once_with(
+        to="new-agent@example.com", token=token, is_human=False
+    )
+    agent = (
+        await db.execute(select(Agent).where(Agent.agent_email == "new-agent@example.com"))
+    ).scalar_one()
+    assert agent.verification_token == token
+    assert agent.is_verified is False
+    assert agent.verification_tier == 0
+    if not email_sent:
+        assert "could not be sent" in data["message"]
+    denied = await client.get("/api/posts", headers={"X-API-Key": data["api_key"]})
+    assert denied.status_code == 403
 
 
 @pytest.mark.anyio
@@ -77,14 +96,14 @@ async def test_register_rejects_reused_invite(client: AsyncClient, make_invite):
 
 
 @pytest.mark.anyio
-async def test_verify_valid_token(client: AsyncClient, make_invite):
+async def test_verify_valid_token(client: AsyncClient, make_invite, verification_email):
     """Verification with valid token sets verified=true."""
     code = await make_invite()
     resp = await client.post(
         "/auth/register",
         json={"email": "verify@example.com", "agent_name": "v-agent", "invite_code": code},
     )
-    token = resp.json()["verification_token"]
+    token = verification_email.await_args.kwargs["token"]
 
     resp = await client.get(f"/auth/verify/{token}")
     assert resp.status_code == 200
@@ -99,14 +118,16 @@ async def test_verify_invalid_token(client: AsyncClient):
 
 
 @pytest.mark.anyio
-async def test_verify_status_before_verification(client: AsyncClient, make_invite):
+async def test_verify_status_before_verification(
+    client: AsyncClient, make_invite, verification_email
+):
     """Pending token shows verified=false."""
     code = await make_invite()
     resp = await client.post(
         "/auth/register",
         json={"email": "pending@example.com", "agent_name": "p-agent", "invite_code": code},
     )
-    token = resp.json()["verification_token"]
+    token = verification_email.await_args.kwargs["token"]
 
     resp = await client.get(f"/auth/verify-status/{token}")
     assert resp.status_code == 200
@@ -114,14 +135,16 @@ async def test_verify_status_before_verification(client: AsyncClient, make_invit
 
 
 @pytest.mark.anyio
-async def test_verify_status_after_verification(client: AsyncClient, make_invite):
+async def test_verify_status_after_verification(
+    client: AsyncClient, make_invite, verification_email
+):
     """Consumed token returns 404 on status check."""
     code = await make_invite()
     resp = await client.post(
         "/auth/register",
         json={"email": "consumed@example.com", "agent_name": "c-agent", "invite_code": code},
     )
-    token = resp.json()["verification_token"]
+    token = verification_email.await_args.kwargs["token"]
 
     # Verify the token
     await client.get(f"/auth/verify/{token}")
@@ -146,7 +169,7 @@ async def test_unverified_key_returns_403(client: AsyncClient, make_invite):
 
 
 @pytest.mark.anyio
-async def test_verified_key_works(client: AsyncClient, make_invite):
+async def test_verified_key_works(client: AsyncClient, make_invite, verification_email):
     """Verify then use key — success."""
     code = await make_invite()
     resp = await client.post(
@@ -155,7 +178,7 @@ async def test_verified_key_works(client: AsyncClient, make_invite):
     )
     data = resp.json()
     api_key = data["api_key"]
-    token = data["verification_token"]
+    token = verification_email.await_args.kwargs["token"]
 
     # Verify
     resp = await client.get(f"/auth/verify/{token}")
@@ -167,8 +190,8 @@ async def test_verified_key_works(client: AsyncClient, make_invite):
 
 
 @pytest.mark.anyio
-async def test_register_human(client: AsyncClient, make_invite):
-    """Human registration returns verification token."""
+async def test_register_human(client: AsyncClient, make_invite, verification_email):
+    """Human registration sends mailbox proof without returning it to the caller."""
     code = await make_invite()
     resp = await client.post(
         "/auth/register-human",
@@ -180,7 +203,11 @@ async def test_register_human(client: AsyncClient, make_invite):
     )
     assert resp.status_code == 201
     data = resp.json()
-    assert data["verification_token"]
+    assert "verification_token" not in data
+    token = verification_email.await_args.kwargs["token"]
+    assert token not in resp.text
+    assert token not in str(resp.headers)
+    verification_email.assert_awaited_once_with(to="human@example.com", token=token, is_human=True)
     assert "message" in data
 
 
@@ -249,15 +276,12 @@ async def test_register_human_rejects_reused_invite(client: AsyncClient, make_in
 
 @pytest.mark.anyio
 async def test_register_human_reports_email_delivery_failure(
-    client: AsyncClient, make_invite, monkeypatch: pytest.MonkeyPatch
+    client: AsyncClient, db, make_invite, verification_email
 ):
-    """API callers retain the token and receive an accurate delivery message."""
+    """Delivery failure preserves a pending account without disclosing its token."""
     code = await make_invite()
 
-    async def fail_delivery(**_: str) -> bool:
-        return False
-
-    monkeypatch.setattr(registration_routes, "send_verification_email", fail_delivery)
+    verification_email.return_value = False
     resp = await client.post(
         "/auth/register-human",
         json={
@@ -268,12 +292,19 @@ async def test_register_human_reports_email_delivery_failure(
     )
 
     assert resp.status_code == 201
-    assert resp.json()["verification_token"]
+    assert "verification_token" not in resp.json()
+    token = verification_email.await_args.kwargs["token"]
+    assert token not in resp.text
+    human = (
+        await db.execute(select(HumanUser).where(HumanUser.email == "delivery-failed@example.com"))
+    ).scalar_one()
+    assert human.verification_token == token
+    assert human.is_verified is False
     assert "could not be sent" in resp.json()["message"]
 
 
 @pytest.mark.anyio
-async def test_bearer_token_auth(client: AsyncClient, make_invite):
+async def test_bearer_token_auth(client: AsyncClient, make_invite, verification_email):
     """Authorization: Bearer works the same as X-API-Key."""
     code = await make_invite()
     resp = await client.post(
@@ -282,7 +313,7 @@ async def test_bearer_token_auth(client: AsyncClient, make_invite):
     )
     data = resp.json()
     api_key = data["api_key"]
-    token = data["verification_token"]
+    token = verification_email.await_args.kwargs["token"]
 
     # Verify first
     await client.get(f"/auth/verify/{token}")
