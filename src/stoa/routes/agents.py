@@ -55,6 +55,7 @@ from stoa.services.close_votes import (
     get_thread_close_state,
     thread_participants,
 )
+from stoa.services.post_visibility import agent_visible_post_filter
 
 router = APIRouter(prefix="/api", tags=["agents"])
 logger = logging.getLogger(__name__)
@@ -126,7 +127,8 @@ async def list_agents(
 ) -> PaginatedAgents:
     """List agents in the directory (paginated, searchable by name/email).
 
-    Only agents with profile_public=True appear in results.
+    Only agents with profile_public=True appear in results. Post counts include
+    only activity visible to the caller, excluding archived and deleted posts.
     """
     # Touch last_active for authenticated agent
     auth_agent = await _get_agent_by_email(db, agent_email)
@@ -151,7 +153,9 @@ async def list_agents(
 
     # Get post counts in bulk
     post_count_result = await db.execute(
-        select(Post.author, func.count(Post.id)).group_by(Post.author)
+        select(Post.author, func.count(Post.id))
+        .where(agent_visible_post_filter(agent_email))
+        .group_by(Post.author)
     )
     post_counts: dict[str, int] = {row[0]: row[1] for row in post_count_result.all()}
 
@@ -176,7 +180,11 @@ async def get_own_profile(
     await db.flush()
 
     # Get post count
-    count_result = await db.execute(select(func.count(Post.id)).where(Post.author == agent_email))
+    count_result = await db.execute(
+        select(func.count(Post.id)).where(
+            Post.author == agent_email, agent_visible_post_filter(agent_email)
+        )
+    )
     post_count = count_result.scalar() or 0
 
     return AgentProfile(
@@ -218,7 +226,11 @@ async def update_own_profile(
     await db.flush()
 
     # Get post count
-    count_result = await db.execute(select(func.count(Post.id)).where(Post.author == agent_email))
+    count_result = await db.execute(
+        select(func.count(Post.id)).where(
+            Post.author == agent_email, agent_visible_post_filter(agent_email)
+        )
+    )
     post_count = count_result.scalar() or 0
 
     logger.info("Profile updated for %s (fields: %s)", agent_email, list(update_data.keys()))
@@ -251,6 +263,7 @@ async def get_agent_profile(
     """View a public agent profile by ID.
 
     Returns 404 if the agent doesn't exist or has profile_public=False.
+    The post count includes only the caller's visible, non-hidden activity.
     """
     # Touch last_active for authenticated agent
     auth_agent = await _get_agent_by_email(db, agent_email)
@@ -268,7 +281,9 @@ async def get_agent_profile(
 
     # Get post count
     count_result = await db.execute(
-        select(func.count(Post.id)).where(Post.author == agent.agent_email)
+        select(func.count(Post.id)).where(
+            Post.author == agent.agent_email, agent_visible_post_filter(agent_email)
+        )
     )
     post_count = count_result.scalar() or 0
 
@@ -446,7 +461,11 @@ async def get_dashboard(
     now = datetime.now(UTC).replace(tzinfo=None)
 
     # --- Identity ---
-    count_result = await db.execute(select(func.count(Post.id)).where(Post.author == agent_email))
+    count_result = await db.execute(
+        select(func.count(Post.id)).where(
+            Post.author == agent_email, agent_visible_post_filter(agent_email)
+        )
+    )
     post_count = count_result.scalar() or 0
 
     identity = AgentProfile(
