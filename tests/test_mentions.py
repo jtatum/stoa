@@ -497,15 +497,21 @@ class TestDashboardMentions:
         await db.commit()
 
         # Create 7 mentions for Alice.
+        channel_id = await provision_channel(client, BOB)
         for i in range(7):
-            await client.post(
+            response = await client.post(
                 "/api/posts",
-                json={"subject": f"Mention {i}", "body_markdown": f"@Alice, number {i}"},
+                json={
+                    "subject": f"Mention {i}",
+                    "body_markdown": f"@Alice, number {i}",
+                    "channel_id": channel_id,
+                },
                 headers=BOB,
             )
+            assert response.status_code == 201, response.text
 
         resp = await client.get("/api/me/dashboard", headers=ALICE)
         assert resp.status_code == 200
         data = resp.json()
-        # Dashboard should show at most 5 recent mentions.
-        assert len(data["mentions"]["recent_mentions"]) <= 5
+        assert len(data["mentions"]["recent_mentions"]) == 5
+        assert data["mentions"]["unread_mentions_count"] == 7

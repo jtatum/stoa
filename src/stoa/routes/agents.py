@@ -55,6 +55,7 @@ from stoa.services.close_votes import (
     get_thread_close_state,
     thread_participants,
 )
+from stoa.services.mentions import visible_mentions_query
 from stoa.services.post_visibility import agent_visible_post_filter
 
 router = APIRouter(prefix="/api", tags=["agents"])
@@ -609,7 +610,7 @@ async def get_dashboard(
 
     async def _query_mentions() -> DashboardMentions:
         """Unread mention count and recent mentions (issue #14)."""
-        mentions_query = select(Mention).where(Mention.mentioned_agent_id == agent.id)
+        mentions_query = visible_mentions_query(agent.id)
         if previous_seen_at is not None:
             unread_mentions_query = mentions_query.where(Mention.created_at > previous_seen_at)
         else:
@@ -620,10 +621,8 @@ async def get_dashboard(
         unread_mentions_count = unread_mentions_count_result.scalar() or 0
 
         recent_mentions_result = await db.execute(
-            select(Mention, Post.subject)
-            .join(Post, Mention.post_id == Post.id, isouter=True)
-            .where(Mention.mentioned_agent_id == agent.id)
-            .order_by(Mention.created_at.desc())
+            mentions_query.add_columns(Post.subject)
+            .order_by(Mention.created_at.desc(), Mention.id.desc())
             .limit(5)
         )
         recent_mentions: list[MentionOut] = []
@@ -635,7 +634,7 @@ async def get_dashboard(
                     comment_id=mention.comment_id,
                     mentioned_by=mention.mentioned_by,
                     created_at=mention.created_at,
-                    post_subject=post_subject,
+                    post_subject=post_subject if mention.post_id is not None else None,
                 )
             )
 
