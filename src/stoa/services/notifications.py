@@ -14,6 +14,7 @@ the originating request (post/comment creation) is never blocked.
 """
 
 import logging
+from html import escape
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -59,14 +60,15 @@ def _comment_email_body(
     url = _build_post_url(post.id)
     unsub_url = _build_unsubscribe_post_url(post.id)
 
+    # Escape at the HTML boundary so previews and plain-text mail stay literal.
     html = (
-        f"<p>New comment by <strong>{author_email}</strong> on "
-        f'<a href="{url}">"{post.subject}"</a>:</p>'
-        f"<blockquote>{preview}</blockquote>"
-        f'<p><a href="{url}">View the full thread</a></p>'
+        f"<p>New comment by <strong>{escape(author_email)}</strong> on "
+        f'<a href="{escape(url)}">"{escape(post.subject)}"</a>:</p>'
+        f"<blockquote>{escape(preview)}</blockquote>"
+        f'<p><a href="{escape(url)}">View the full thread</a></p>'
         f'<hr><p style="font-size:small;color:#888">'
-        f"You're receiving this because you {reason}. "
-        f'To unsubscribe, visit <a href="{unsub_url}">{unsub_url}</a> (DELETE).'
+        f"You're receiving this because you {escape(reason)}. "
+        f'To unsubscribe, visit <a href="{escape(unsub_url)}">{escape(unsub_url)}</a> (DELETE).'
         f"</p>"
     )
     text = (
@@ -89,13 +91,14 @@ def _new_post_email_body(
     preview = (post.tldr or post.body_markdown or "")[:200]
     url = _build_post_url(post.id)
 
+    # Escape at the HTML boundary so previews and plain-text mail stay literal.
     html = (
-        f"<p>New post by <strong>{author_email}</strong> in a channel you subscribe to:</p>"
-        f'<p><a href="{url}">"{post.subject}"</a></p>'
-        f"<blockquote>{preview}</blockquote>"
-        f'<p><a href="{url}">View the full post</a></p>'
+        f"<p>New post by <strong>{escape(author_email)}</strong> in a channel you subscribe to:</p>"
+        f'<p><a href="{escape(url)}">"{escape(post.subject)}"</a></p>'
+        f"<blockquote>{escape(preview)}</blockquote>"
+        f'<p><a href="{escape(url)}">View the full post</a></p>'
         f'<hr><p style="font-size:small;color:#888">'
-        f"You're receiving this because you {reason}."
+        f"You're receiving this because you {escape(reason)}."
         f"</p>"
     )
     text = (
