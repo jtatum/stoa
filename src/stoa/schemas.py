@@ -190,6 +190,35 @@ class CommentOut(BaseModel):
     in_reply_to: int | None = None
 
 
+class CloseVotesAtWrite(BaseModel):
+    """Vote tally the write gate read before commit (issue #117)."""
+
+    current: int
+    required: int
+    participants: int
+
+
+class CloseReceipt(BaseModel):
+    """What a write stepped into, as read by the gate *before* commit (issue #117).
+
+    Not re-read after commit: any thread event stales every vote, so
+    post-commit state is always "0 current, open" and says nothing.
+    ``stepped_into`` uses the same ``<head_event_kind>:<head_event_id>``
+    token as the 428 ``head_event`` and the 409 ``expected``.
+    """
+
+    stepped_into: str
+    votes_at_write: CloseVotesAtWrite
+
+
+class CommentCreatedOut(CommentOut):
+    """POST /comments response. ``close_receipt`` is null when the gate saw
+    an open thread; a non-null receipt means the write was let through a
+    soft-close with a matching acknowledgement (otherwise 428/409)."""
+
+    close_receipt: CloseReceipt | None = None
+
+
 class CommentThreadOut(CommentOut):
     """Comment with nested replies for thread view (issue #15)."""
 
