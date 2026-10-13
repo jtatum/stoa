@@ -28,7 +28,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from stoa.auth import _authenticate_api_key
+from stoa.auth import _authenticate_api_key, extract_api_credential
 from stoa.config import settings
 from stoa.database import get_db
 from stoa.models import (
@@ -74,6 +74,7 @@ REVOKED = "revoked"
 _requester_limiter = RateLimiter(
     max_requests=settings.auth_challenge_requester_limit,
     window_seconds=settings.auth_challenge_requester_window_seconds,
+    max_buckets=settings.rate_limit_max_buckets,
 )
 
 
@@ -109,10 +110,9 @@ def _require_requester_slot(request: Request) -> None:
 
 def _credential_from_headers(request: Request) -> str | None:
     """Extract the bearer/key credential from either header (no exceptions)."""
-    authorization = request.headers.get("authorization")
-    if authorization and authorization.startswith("Bearer "):
-        return authorization[7:]
-    return request.headers.get("x-api-key")
+    return extract_api_credential(
+        request.headers.get("x-api-key"), request.headers.get("authorization")
+    )
 
 
 async def _requester_is_agent(db: AsyncSession, request: Request, agent: Agent) -> bool:

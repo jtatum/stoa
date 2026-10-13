@@ -1,29 +1,31 @@
 """In-memory sliding window rate limiter per API key.
 
-Default limit is configurable via the ``RATE_LIMIT_MAX`` and
-``RATE_LIMIT_WINDOW_SECONDS`` env vars.
+Limits and storage are configurable via ``RATE_LIMIT_MAX``,
+``RATE_LIMIT_WINDOW_SECONDS``, and ``RATE_LIMIT_MAX_BUCKETS``.
 
 Admin-key requests bypass the limiter on ``/api/admin/*`` only, so that
 operational sequences stay unthrottled without granting unlimited rate on
-every other endpoint. Admin-key requests to any other path are subject to
-the normal per-key limit. Every admin-key request is audited regardless of
-whether it was bypassed.
+every other endpoint. Elsewhere, admin-key requests follow the normal
+credential or public-IP limit. Admin-key identities are audited regardless
+of whether they bypass the limiter.
 
-Unauthenticated requests fall through untouched, except on the public
-read surface (``/api/public/*``), where they are keyed on client IP so
-anonymous traffic cannot bypass rate limiting.
+The public read surface (``/api/public/*``) is always keyed on client IP:
+those routes do not authenticate credentials, so arbitrary headers must
+not replace the IP identity. Other requests without credentials pass through.
 """
 
 import hashlib
 import ipaddress
 import logging
+import math
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import JSONResponse
 
+from stoa.auth import extract_api_credential
 from stoa.config import settings
 from stoa.security import audit_log
 
@@ -31,42 +33,71 @@ logger = logging.getLogger(__name__)
 
 
 class RateLimiter:
-    def __init__(self, max_requests: int, window_seconds: int) -> None:
+    """Bounded, process-local sliding windows using a monotonic clock.
+
+    Buckets are ordered by their last accepted request, so idle buckets can
+    be reclaimed without scanning active identities. At capacity, new
+    identities are denied until a bucket expires; evicting an active bucket
+    would let identity churn reset an exhausted allowance.
+    """
+
+    def __init__(self, max_requests: int, window_seconds: int, max_buckets: int = 10_000) -> None:
+        if max_buckets < 1:
+            raise ValueError("max_buckets must be positive")
         self.max_requests = max_requests
         self.window_seconds = window_seconds
-        self._requests: dict[str, deque[float]] = defaultdict(deque)
+        self.max_buckets = max_buckets
+        self._requests: OrderedDict[str, deque[float]] = OrderedDict()
 
-    def _clean(self, key: str) -> None:
-        now = time.time()
-        window = self._requests[key]
+    def _clean(self, key: str, now: float) -> deque[float] | None:
+        while self._requests:
+            oldest_window = next(iter(self._requests.values()))
+            if oldest_window[-1] > now - self.window_seconds:
+                break
+            self._requests.popitem(last=False)
+        window = self._requests.get(key)
         while window and window[0] <= now - self.window_seconds:
             window.popleft()
+        return window
 
     def is_allowed(self, key: str) -> bool:
-        self._clean(key)
-        window = self._requests[key]
+        now = time.monotonic()
+        window = self._clean(key, now)
+        if window is None:
+            if len(self._requests) >= self.max_buckets or self.max_requests <= 0:
+                return False
+            window = deque()
+            self._requests[key] = window
         if len(window) >= self.max_requests:
             return False
-        window.append(time.time())
+        window.append(now)
+        self._requests.move_to_end(key)
         return True
 
     def remaining(self, key: str) -> int:
-        self._clean(key)
-        return max(0, self.max_requests - len(self._requests[key]))
+        window = self._clean(key, time.monotonic())
+        if window is None and len(self._requests) >= self.max_buckets:
+            return 0
+        return max(0, self.max_requests - len(window or ()))
 
     def retry_after(self, key: str) -> int:
-        self._clean(key)
-        window = self._requests[key]
-        if not window:
+        now = time.monotonic()
+        window = self._clean(key, now)
+        if window:
+            expires_at = window[0] + self.window_seconds
+        elif len(self._requests) >= self.max_buckets:
+            # A new identity needs a whole bucket to expire, not just one
+            # timestamp within an existing bucket's sliding window.
+            expires_at = next(iter(self._requests.values()))[-1] + self.window_seconds
+        else:
             return 0
-        oldest = window[0]
-        seconds_until_free = int(oldest + self.window_seconds - time.time()) + 1
-        return max(1, seconds_until_free)
+        return max(1, math.ceil(expires_at - now))
 
 
 _limiter = RateLimiter(
     max_requests=settings.rate_limit_max,
     window_seconds=settings.rate_limit_window_seconds,
+    max_buckets=settings.rate_limit_max_buckets,
 )
 
 
@@ -80,13 +111,19 @@ ADMIN_PATH_PREFIX = "/api/admin"
 
 
 def _extract_api_key(request: Request) -> str | None:
-    """Extract the rate-limit identity key from the request."""
-    api_key = request.headers.get("x-api-key")
-    if api_key:
-        return api_key
+    """Use auth's credential precedence and fixed-size, separate namespaces.
+
+    Only digests are retained, including for session tokens. An API credential
+    whose raw value starts with ``admin:`` cannot claim the admin exemption.
+    """
+    api_key = extract_api_credential(
+        request.headers.get("x-api-key"), request.headers.get("authorization")
+    )
+    if api_key is not None:
+        return f"api:{hashlib.sha256(api_key.encode('utf-8')).hexdigest()}"
     admin_key = request.headers.get("x-admin-key")
     if admin_key:
-        return f"{ADMIN_KEY_PREFIX}{admin_key}"  # nosemgrep
+        return f"{ADMIN_KEY_PREFIX}{hashlib.sha256(admin_key.encode('utf-8')).hexdigest()}"
     return None
 
 
@@ -100,17 +137,9 @@ def _is_admin_path(path: str) -> bool:
 
 
 def _identity_label(key: str) -> str:
-    """Stable, non-reversible identifier for audit records.
-
-    Agent keys keep the historical 8-character prefix. Admin keys are
-    hashed instead: the bypass is now scoped, so an admin key can reach
-    the throttled branch and its audit entry, and a raw prefix there
-    would write live admin key material into the audit log.
-    """
-    if key.startswith(ADMIN_KEY_PREFIX):
-        raw = key[len(ADMIN_KEY_PREFIX) :]
-        return f"{ADMIN_KEY_PREFIX}{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]}"
-    return key[:8]
+    """Short label from a namespaced credential digest; no secret prefixes."""
+    namespace, digest = key.split(":", 1)
+    return f"{namespace}:{digest[:12]}"
 
 
 PUBLIC_PATH_PREFIX = "/api/public"
@@ -219,22 +248,6 @@ def _extract_client_ip(request: Request) -> str | None:
 class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         key = _extract_api_key(request)
-        if key is None:
-            # Unauthenticated requests fall through untouched — except on
-            # the public read surface, which is keyed on client IP so
-            # anonymous traffic cannot bypass rate limiting entirely.
-            if _is_public_read_path(request.url.path):
-                client_ip = _extract_client_ip(request)
-                if client_ip is not None:
-                    key = f"ip:{client_ip}"
-                else:
-                    logger.warning(
-                        "rate_limit: unidentifiable client on public path %s "
-                        "(no peer, no valid Fly-Client-IP) — passing unthrottled",
-                        request.url.path,
-                    )
-            if key is None:
-                return await call_next(request)
 
         # Admin-key requests bypass rate limiting on /api/admin/* so operators
         # can run rapid operational sequences (key resets, stats, audit scans)
@@ -245,7 +258,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # was written only when a request was throttled, which by definition
         # never happened for admin keys — leaving admin-key use unlogged, and
         # a leaked key invisible.
-        if key.startswith(ADMIN_KEY_PREFIX):
+        if key is not None and key.startswith(ADMIN_KEY_PREFIX):
             bypassed = _is_admin_path(request.url.path)
             audit_log(
                 "admin_key_request",
@@ -259,6 +272,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             )
             if bypassed:
                 return await call_next(request)
+
+        if _is_public_read_path(request.url.path):
+            # Public routes never authenticate headers. Even a valid key
+            # must not replace the IP bucket on this anonymous surface.
+            client_ip = _extract_client_ip(request)
+            key = f"ip:{client_ip}" if client_ip is not None else None
+            if key is None:
+                logger.warning(
+                    "rate_limit: unidentifiable client on public path %s "
+                    "(no peer, no valid Fly-Client-IP) — passing unthrottled",
+                    request.url.path,
+                )
+        if key is None:
+            return await call_next(request)
 
         if not _limiter.is_allowed(key):
             retry_after = _limiter.retry_after(key)

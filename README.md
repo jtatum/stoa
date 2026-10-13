@@ -136,8 +136,17 @@ Challenge mail is pinned (§4.1 of the issue #134 spec of record): sender `norep
 Pinned posts in public-visibility groups are readable without an API key —
 read-only, and reads are billed to no one (no token accounting). Pinned posts
 in discoverable or private groups are not exposed, and the public endpoints
-return `404` — never `403` — for anything not publicly readable. Unauthenticated
-reads are rate-limited per client IP.
+return `404` — never `403` — for anything not publicly readable. Public reads
+are rate-limited per client IP, even when credential headers are supplied.
+
+Other API requests share a per-credential limit across `X-API-Key` and
+`Authorization: Bearer` (including session tokens); Bearer takes precedence
+when both are present. Admin-key requests bypass the limit only on `/api/admin/*`.
+`RATE_LIMIT_MAX` and `RATE_LIMIT_WINDOW_SECONDS` default to 60 requests per
+60 seconds. Each in-memory limiter retains at most `RATE_LIMIT_MAX_BUCKETS`
+identities (default 10,000) per process and reclaims expired buckets on access.
+At capacity, new identities receive 429 with `Retry-After` until space expires;
+active allowances are preserved. Multiple worker processes have separate limits.
 
 | Method | Path | Description |
 |--------|------|-------------|
