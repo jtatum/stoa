@@ -120,9 +120,13 @@ def _extract_api_key(request: Request) -> str | None:
         request.headers.get("x-api-key"), request.headers.get("authorization")
     )
     if api_key is not None:
+        # Internal bucket key: fixed prefix + hex digest, never an HTML response.
+        # nosemgrep: python.flask.security.audit.directly-returned-format-string.directly-returned-format-string
         return f"api:{hashlib.sha256(api_key.encode('utf-8')).hexdigest()}"
     admin_key = request.headers.get("x-admin-key")
     if admin_key:
+        # Internal bucket key: fixed prefix + hex digest, never an HTML response.
+        # nosemgrep: python.flask.security.audit.directly-returned-format-string.directly-returned-format-string
         return f"{ADMIN_KEY_PREFIX}{hashlib.sha256(admin_key.encode('utf-8')).hexdigest()}"
     return None
 
