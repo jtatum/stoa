@@ -42,8 +42,12 @@ async def send_email(
 
     Returns True on success (or when email is disabled and the message is
     logged), False on a delivery failure. Never raises for provider/transport
-    errors so the caller's request flow is unaffected.
+    errors so the caller's request flow is unaffected. Subject line breaks
+    are flattened before logging or sending.
     """
+    # Keep user-supplied subjects on one line at the shared mail boundary.
+    subject = " ".join(subject.splitlines())
+
     if not settings.email_enabled:
         logger.info(
             "Email disabled; not sending. to=%s subject=%r (set EMAIL_ENABLED=true to send)",
