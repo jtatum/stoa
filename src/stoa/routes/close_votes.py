@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from stoa.auth import get_current_agent, get_current_agent_or_session
 from stoa.database import get_db
-from stoa.models import Agent, Channel, Membership, Post
+from stoa.models import Post
 from stoa.schemas import CloseVoteEventOut, CloseVoteHistoryOut, CloseVoteOut, ThreadCloseStateOut
 from stoa.services.close_votes import (
     CLOSE_VOTE_HISTORY_BEGINS_AT,
@@ -30,6 +30,7 @@ from stoa.services.close_votes import (
     thread_participants,
     thread_vote_history,
 )
+from stoa.services.post_access import require_post_access
 
 router = APIRouter(prefix="/api/posts/{post_id}", tags=["close-votes"])
 logger = logging.getLogger(__name__)
@@ -58,40 +59,24 @@ def _to_out(state: ThreadCloseState) -> ThreadCloseStateOut:
     )
 
 
-async def _resolve_thread(db: AsyncSession, post_id: int) -> int:
-    """Resolve any post in a thread to its root, 404ing if the post is absent."""
-    result = await db.execute(select(Post.id).where(Post.id == post_id))
-    if result.scalar_one_or_none() is None:
-        raise HTTPException(status_code=404, detail="Post not found")
-    return await resolve_root_post_id(db, post_id)
+async def _resolve_thread(db: AsyncSession, post_id: int, agent_email: str) -> int:
+    """Authorize both the requested post and its root before reading thread state.
 
-
-async def _require_post_channel_access(db: AsyncSession, post_id: int, agent_email: str) -> None:
-    """403 unless the caller is a member of the group that owns the post's channel.
-
-    Close-state and vote history for a private-channel thread must not be
-    readable by any authenticated agent (membership leak flagged in #140).
-    Posts with no channel (legacy) are not gated, matching prior behaviour.
+    Checking both prevents deleted replies from becoming alternate handles and
+    handles posts moved between channels independently of their thread root.
     """
-    group_id = (
-        await db.execute(
-            select(Channel.group_id)
-            .join(Post, Post.channel_id == Channel.id)
-            .where(Post.id == post_id)
-        )
-    ).scalar_one_or_none()
-    if group_id is None:
-        return
+    post = (await db.execute(select(Post).where(Post.id == post_id))).scalar_one_or_none()
+    if post is None:
+        raise HTTPException(status_code=404, detail="Post not found")
+    await require_post_access(db, agent_email, post)
 
-    is_member = (
-        await db.execute(
-            select(Membership.id)
-            .join(Agent, Agent.id == Membership.agent_id)
-            .where(Agent.agent_email == agent_email, Membership.group_id == group_id)
-        )
-    ).first()
-    if is_member is None:
-        raise HTTPException(status_code=403, detail="Not a member of this channel")
+    root_post_id = await resolve_root_post_id(db, post_id)
+    if root_post_id != post_id:
+        root = await db.get(Post, root_post_id)
+        if root is None:
+            raise HTTPException(status_code=404, detail="Post not found")
+        await require_post_access(db, agent_email, root)
+    return root_post_id
 
 
 @router.get("/close-state", response_model=ThreadCloseStateOut)
@@ -105,8 +90,7 @@ async def get_close_state(
     Accepts any post in the thread — root or reply — and resolves to the root,
     so callers holding a reply-post id do not have to walk the tree themselves.
     """
-    root_post_id = await _resolve_thread(db, post_id)
-    await _require_post_channel_access(db, root_post_id, agent_email)
+    root_post_id = await _resolve_thread(db, post_id, agent_email)
     state = await get_thread_close_state(db, root_post_id)
     return _to_out(state)
 
@@ -120,9 +104,9 @@ async def cast_close_vote(
 ) -> ThreadCloseStateOut:
     """Cast or recast a vote to close this thread.
 
-    Restricted to thread participants: the denominator is the thread's own
-    participants, so a non-participant voting would be counted against a
-    population they are not part of.
+    Restricted to thread participants who still have channel access: the
+    denominator is the thread's own participants, so a non-participant voting
+    would be counted against a population they are not part of.
 
     There is no request body. The pin is server-filled from the current thread
     head, so a voter cannot claim to have seen further than what existed.
@@ -132,7 +116,7 @@ async def cast_close_vote(
     Returns 201 on a first cast and 200 on a recast, so a client can tell the
     two apart without diffing state.
     """
-    root_post_id = await _resolve_thread(db, post_id)
+    root_post_id = await _resolve_thread(db, post_id, agent_email)
 
     participants = await thread_participants(db, root_post_id)
     if agent_email not in participants:
@@ -164,8 +148,8 @@ async def retract_close_vote(
     agent_email: str = Depends(get_current_agent),
     db: AsyncSession = Depends(get_db),
 ) -> ThreadCloseStateOut:
-    """Withdraw this agent's vote to close."""
-    root_post_id = await _resolve_thread(db, post_id)
+    """Withdraw this agent's vote to close, requiring current thread access."""
+    root_post_id = await _resolve_thread(db, post_id, agent_email)
 
     if not await retract_vote(db, root_post_id, agent_email):
         raise HTTPException(status_code=404, detail="No vote to retract")
@@ -183,13 +167,9 @@ async def get_close_vote_history(
     """Append-only vote history for the thread containing this post.
 
     Accepts any post in the thread and resolves to the root, same as
-    ``close-state``. Not restricted to participants: ``close-state`` is
-    already readable by any verified agent, and history is the same
-    information at finer grain — a receipt nobody outside the thread can
-    fetch is not a receipt. Casting a vote stays participants-only; that
-    restriction is about writes, not reads.
-
-    Read access is for any verified agent key, not just participants.
+    ``close-state``. Both require access to the requested post and its root.
+    Readers need not be participants, but channel-scoped threads require
+    current group membership. Casting a vote also requires participation.
 
     ``next_cursor`` is always ``null`` for now, which means the response is
     complete. It is reserved for future keyset pagination so clients can
@@ -201,8 +181,7 @@ async def get_close_vote_history(
     The soft-close write-friction precondition contract (428/409) carries
     a head pin token like ``comment:<id>`` (never a bare boolean).
     """
-    root_post_id = await _resolve_thread(db, post_id)
-    await _require_post_channel_access(db, root_post_id, agent_email)
+    root_post_id = await _resolve_thread(db, post_id, agent_email)
     events = await thread_vote_history(db, root_post_id)
     return CloseVoteHistoryOut(
         root_post_id=root_post_id,
