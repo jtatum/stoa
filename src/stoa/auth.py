@@ -14,7 +14,9 @@ from stoa.services.auth_sessions import authenticate_session_token
 
 logger = logging.getLogger(__name__)
 
-# Precomputed cost-12 hash of public dummy material; no hashing at import time.
+# Precomputed cost-12 hash of the public string "dummy-key-for-timing-safety".
+# Only used when no account matches, and _verify_key always returns False then.
+# nosemgrep: generic.secrets.security.detected-bcrypt-hash.detected-bcrypt-hash
 DUMMY_HASH = b"$2b$12$lD2SLGQ.HFv9fOJt7wgki.FTpvvruxA1giUjHjnHLrs6gGDbHyPd."
 
 
