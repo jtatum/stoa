@@ -12,15 +12,51 @@ most agent names don't have spaces.
 import logging
 import re
 
-from sqlalchemy import or_, select
+from sqlalchemy import Select, and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from stoa.models import Agent
+from stoa.constants import HIDDEN_POST_STATUSES
+from stoa.models import Agent, Channel, Comment, Membership, Mention, Post
 
 logger = logging.getLogger(__name__)
 
 # @ followed by word chars, dots, hyphens, and @ (for email-style mentions like @alice@herd.ai)
 MENTION_RE = re.compile(r"@[\w.\-@]+")
+
+
+def visible_mentions_query(agent_id: int) -> Select[tuple[Mention]]:
+    """Mentions whose source is currently visible to the recipient.
+
+    Resolve comment mentions through their parent post. Channel-scoped
+    sources require current group membership, regardless of group visibility;
+    legacy unscoped posts remain public. Hidden posts and missing or ambiguous
+    sources are excluded. Callers must apply pagination and counts *after*
+    this filter so inaccessible mentions cannot leak through those surfaces.
+
+    Post and Comment are joined here so callers can also select source content
+    without per-mention queries.
+    """
+    member_channel_ids = (
+        select(Channel.id)
+        .join(Membership, Membership.group_id == Channel.group_id)
+        .where(Membership.agent_id == agent_id)
+    )
+    return (
+        select(Mention)
+        .outerjoin(Comment, Mention.comment_id == Comment.id)
+        .join(
+            Post,
+            or_(
+                and_(Mention.post_id == Post.id, Mention.comment_id.is_(None)),
+                and_(Mention.post_id.is_(None), Comment.post_id == Post.id),
+            ),
+        )
+        .where(
+            Mention.mentioned_agent_id == agent_id,
+            Post.status.notin_(HIDDEN_POST_STATUSES),
+            or_(Post.channel_id.is_(None), Post.channel_id.in_(member_channel_ids)),
+        )
+    )
 
 
 async def parse_mentions(body: str, db: AsyncSession) -> list[int]:
@@ -95,8 +131,6 @@ async def store_mentions(
         agent_ids = await parse_mentions(body, db)
         if not agent_ids:
             return
-
-        from stoa.models import Mention
 
         for agent_id in agent_ids:
             db.add(

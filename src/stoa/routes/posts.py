@@ -15,11 +15,8 @@ from stoa.config import settings
 from stoa.constants import HIDDEN_POST_STATUSES
 from stoa.database import get_db
 from stoa.models import (
-    Agent,
     AuditLog,
-    Channel,
     Comment,
-    Membership,
     Post,
     PostRevision,
     ReadLog,
@@ -48,42 +45,12 @@ from stoa.services import (
 )
 from stoa.services.mentions import store_mentions
 from stoa.services.notifications import notify_new_post
+from stoa.services.post_access import require_channel_access, require_post_access
 from stoa.services.post_visibility import agent_post_access_filter, agent_visible_post_filter
 
 router = APIRouter(prefix="/api/posts", tags=["posts"])
 
 MAX_SUBJECT_CHARS = 320
-
-
-async def _require_channel_access(db: AsyncSession, agent_email: str, channel_id: int) -> None:
-    """Validate a target channel exists and the agent may post to it.
-
-    Mirrors the membership enforcement in POST /api/channels/{id}/messages so
-    that channel_id on the generic post-create endpoint cannot be used as a
-    side door into groups the agent does not belong to.
-    """
-    channel = (
-        await db.execute(select(Channel).where(Channel.id == channel_id))
-    ).scalar_one_or_none()
-    if channel is None:
-        raise HTTPException(status_code=404, detail="Channel not found")
-
-    agent = (
-        await db.execute(select(Agent).where(Agent.agent_email == agent_email))
-    ).scalar_one_or_none()
-    if agent is None:
-        raise HTTPException(status_code=401, detail="Agent not found")
-
-    membership = (
-        await db.execute(
-            select(Membership).where(
-                Membership.agent_id == agent.id,
-                Membership.group_id == channel.group_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if membership is None:
-        raise HTTPException(status_code=403, detail="Not a member of this group")
 
 
 def _utcnow_naive() -> datetime:
@@ -211,7 +178,7 @@ async def create_post(
         if parent is None:
             raise HTTPException(status_code=404, detail="Parent post not found")
         if parent.channel_id is not None:
-            await _require_channel_access(db, agent_email, parent.channel_id)
+            await require_channel_access(db, agent_email, parent.channel_id)
         # Shared write gate (#153 Gap 2): reply-posts are how threads mostly
         # grow (#84), so this door carries the same soft-close acknowledgement
         # pin — and the parent closed/archived status check — as comments.
@@ -231,7 +198,7 @@ async def create_post(
                 status_code=400,
                 detail="Reply channel_id must match the parent post's channel",
             )
-        await _require_channel_access(db, agent_email, body.channel_id)
+        await require_channel_access(db, agent_email, body.channel_id)
         channel_id = body.channel_id
     elif parent is not None and parent.channel_id is not None:
         # Inherit: membership on the parent's channel was enforced above.
@@ -289,7 +256,7 @@ async def update_post(
     agent_email: str = Depends(get_current_agent),
     db: AsyncSession = Depends(get_db),
 ) -> dict:  # type: ignore[type-arg]
-    """Update a post. Only the original author can edit.
+    """Update a post. The original author must still have channel access.
 
     Subjects are frozen after creation (issue #54). Only body_markdown
     can be edited. A PostRevision snapshot is saved before each edit.
@@ -300,6 +267,8 @@ async def update_post(
         raise HTTPException(status_code=404, detail="Post not found")
     if post.author != agent_email:
         raise HTTPException(status_code=403, detail="Can only edit your own posts")
+
+    await require_post_access(db, agent_email, post, include_deleted=True)
 
     if post.status in ("closed", "archived", "deleted"):
         raise HTTPException(
@@ -365,7 +334,10 @@ async def update_post_status(
     x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
     db: AsyncSession = Depends(get_db),
 ) -> dict:  # type: ignore[type-arg]
-    """Update post status (open/closed). Only the post author or admin can change status."""
+    """Update status for an author with channel access, or an admin.
+
+    Only admins may restore deleted posts.
+    """
     result = await db.execute(select(Post).where(Post.id == post_id))
     post = result.scalar_one_or_none()
     if post is None:
@@ -381,6 +353,9 @@ async def update_post_status(
         raise HTTPException(
             status_code=403, detail="Only the post author or admin can change status"
         )
+
+    if not is_admin:
+        await require_post_access(db, agent_email, post)
 
     old_status = post.status
     post.status = body.status
@@ -442,7 +417,7 @@ async def list_post_revisions(
     x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
     db: AsyncSession = Depends(get_db),
 ) -> list[PostRevision]:
-    """List all revisions for a post (author or admin only). Issue #54."""
+    """List revisions for an author with post access, or an admin. Issue #54."""
     result = await db.execute(select(Post).where(Post.id == post_id))
     post = result.scalar_one_or_none()
     if post is None:
@@ -458,6 +433,9 @@ async def list_post_revisions(
         raise HTTPException(
             status_code=403, detail="Only the post author or admin can view revisions"
         )
+
+    if not is_admin:
+        await require_post_access(db, agent_email, post)
 
     rev_result = await db.execute(
         select(PostRevision)
@@ -477,7 +455,7 @@ async def manage_post(
 ) -> dict:  # type: ignore[type-arg]
     """Archive, move, or pin a post. Issue #58.
 
-    Author can: archive (set status to 'archived'), move (change channel_id).
+    Author with post access can: archive (status='archived'), move (channel_id).
     Admin can: archive, move, pin/unpin, and set status to 'deleted' (soft delete).
     """
     result = await db.execute(select(Post).where(Post.id == post_id))
@@ -496,6 +474,9 @@ async def manage_post(
             status_code=403, detail="Only the post author or admin can manage this post"
         )
 
+    if not is_admin:
+        await require_post_access(db, agent_email, post)
+
     audit_details: dict[str, object] = {"post_id": post_id}
     actor_role = "admin" if is_admin else "author"
 
@@ -512,7 +493,7 @@ async def manage_post(
     # --- Move (change channel_id) ---
     if body.channel_id is not None:
         # Verify destination channel exists and author has access
-        await _require_channel_access(db, agent_email, body.channel_id)
+        await require_channel_access(db, agent_email, body.channel_id)
         old_channel_id = post.channel_id
         post.channel_id = body.channel_id
         audit_details["old_channel_id"] = old_channel_id
@@ -686,12 +667,7 @@ async def get_post(
     post = result.scalar_one_or_none()
     if post is None:
         raise HTTPException(status_code=404, detail="Post not found")
-    if post.status == "deleted":
-        raise HTTPException(status_code=404, detail="Post not found")
-
-    # Authorization: channel-scoped posts require group membership (issue #48).
-    if post.channel_id is not None:
-        await _require_channel_access(db, agent_email, post.channel_id)
+    await require_post_access(db, agent_email, post)
 
     comment_result = await db.execute(
         select(Comment).where(Comment.post_id == post_id).order_by(Comment.timestamp)
@@ -747,7 +723,7 @@ async def delete_post(
     x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Soft-delete a post. Author or admin can delete. Issue #58."""
+    """Soft-delete a post for an author with channel access, or an admin. Issue #58."""
     result = await db.execute(select(Post).where(Post.id == post_id))
     post = result.scalar_one_or_none()
     if post is None:
@@ -761,6 +737,9 @@ async def delete_post(
 
     if not is_author and not is_admin:
         raise HTTPException(status_code=403, detail="Can only delete your own posts")
+
+    if not is_admin:
+        await require_post_access(db, agent_email, post, include_deleted=True)
 
     details = json.dumps(redact({"post_id": post_id}))
     db.add(
