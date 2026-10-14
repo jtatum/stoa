@@ -4,14 +4,13 @@ import json
 import logging
 import os
 import secrets
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stoa.auth import get_current_agent, get_current_agent_or_session
-from stoa.config import settings
 from stoa.constants import HIDDEN_POST_STATUSES
 from stoa.database import get_db
 from stoa.models import (
@@ -35,16 +34,15 @@ from stoa.schemas import (
     PostUpdate,
     PostUpdated,
 )
-from stoa.security import audit, redact, sanitize_input, sanitize_short_field
+from stoa.security import redact, sanitize_input, sanitize_short_field
 from stoa.services import (
-    assess_spam,
-    body_fingerprint,
     count_tokens,
     generate_tldr,
     render_body_html,
 )
 from stoa.services.mentions import store_mentions
 from stoa.services.notifications import notify_new_post
+from stoa.services.post_abuse import enforce_post_abuse_checks
 from stoa.services.post_access import require_channel_access, require_post_access
 from stoa.services.post_visibility import agent_post_access_filter, agent_visible_post_filter
 
@@ -56,98 +54,6 @@ MAX_SUBJECT_CHARS = 320
 def _utcnow_naive() -> datetime:
     """Naive UTC to match Post.timestamp storage."""
     return datetime.now(UTC).replace(tzinfo=None)
-
-
-async def _enforce_post_abuse_checks(db: AsyncSession, agent_email: str, body_md: str) -> None:
-    """Velocity, duplicate, and spam gates for post creation (issue #21).
-
-    Raises HTTPException on a hard block; writes an audit row for every
-    flagged event (hard or soft).
-    """
-    now = _utcnow_naive()
-
-    # 1) Posting velocity: max N posts per rolling window per author.
-    if settings.post_rate_limit > 0:
-        window_start = now - timedelta(seconds=settings.post_rate_window_seconds)
-        recent_count = await db.execute(
-            select(func.count(Post.id)).where(
-                Post.author == agent_email,
-                Post.timestamp >= window_start,
-            )
-        )
-        if (recent_count.scalar() or 0) >= settings.post_rate_limit:
-            await audit(
-                db,
-                "post_rate_limited",
-                agent_email=agent_email,
-                details={
-                    "limit": settings.post_rate_limit,
-                    "window_s": settings.post_rate_window_seconds,
-                },
-            )
-            # Persist the audit row before the request transaction unwinds
-            # (get_db rolls back on HTTPException, which would otherwise
-            # discard the record of the blocked attempt).
-            await db.commit()
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"Post rate limit reached "
-                    f"({settings.post_rate_limit} per "
-                    f"{settings.post_rate_window_seconds}s). Try again later."
-                ),
-            )
-
-    # 2) Duplicate content: identical normalized body by same author in window.
-    if settings.duplicate_window_seconds > 0:
-        dup_start = now - timedelta(seconds=settings.duplicate_window_seconds)
-        recent_bodies = await db.execute(
-            select(Post.body_markdown).where(
-                Post.author == agent_email,
-                Post.timestamp >= dup_start,
-            )
-        )
-        fingerprint = body_fingerprint(body_md)
-        for (existing_body,) in recent_bodies.all():
-            if body_fingerprint(existing_body) == fingerprint:
-                await audit(
-                    db,
-                    "post_duplicate_rejected",
-                    agent_email=agent_email,
-                    details={"window_s": settings.duplicate_window_seconds},
-                )
-                await db.commit()
-                raise HTTPException(
-                    status_code=409,
-                    detail="Duplicate of a recent post; wait before reposting.",
-                )
-
-    # 3) Spam heuristics: link/mention volume.
-    spam = assess_spam(
-        body_md,
-        max_links=settings.spam_max_links,
-        max_mentions=settings.spam_max_mentions,
-        hard_multiplier=settings.spam_hard_multiplier,
-    )
-    if spam.reject:
-        await audit(
-            db,
-            "post_spam_rejected",
-            agent_email=agent_email,
-            details={"links": spam.links, "mentions": spam.mentions, "reasons": spam.reasons},
-        )
-        await db.commit()
-        raise HTTPException(
-            status_code=422,
-            detail="Post rejected: excessive links or mentions.",
-        )
-    if spam.flag:
-        await audit(
-            db,
-            "post_spam_flagged",
-            agent_email=agent_email,
-            details={"links": spam.links, "mentions": spam.mentions, "reasons": spam.reasons},
-        )
 
 
 @router.post("", response_model=PostCreated, status_code=201)
@@ -216,7 +122,7 @@ async def create_post(
             ),
         )
 
-    await _enforce_post_abuse_checks(db, agent_email, body_md)
+    await enforce_post_abuse_checks(db, agent_email, body_md)
 
     body_html = render_body_html(body_md)
     tldr = generate_tldr(body_md)

@@ -15,6 +15,7 @@ from stoa.routes.comments import enforce_soft_close_acknowledgement
 from stoa.schemas import ChannelMessageCreate, ChannelMessageDetail, ChannelMessageSummary
 from stoa.security import sanitize_input, sanitize_short_field
 from stoa.services import count_tokens, generate_tldr, render_body_html
+from stoa.services.post_abuse import enforce_post_abuse_checks
 from stoa.services.post_access import require_post_access
 
 router = APIRouter(tags=["messages"])
@@ -81,6 +82,8 @@ async def post_message(
 
     subject = sanitize_short_field(body.subject, MAX_SUBJECT_CHARS)
     body_md = sanitize_input(body.body_markdown)
+    await enforce_post_abuse_checks(db, agent_email, body_md)
+
     body_html = render_body_html(body_md)
     tldr = generate_tldr(body_md)
     token_cost = count_tokens(body_md)
