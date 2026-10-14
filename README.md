@@ -272,6 +272,11 @@ All four accept **any** post in a thread — root or reply — and resolve to th
 
 Channel-scoped post creation and listing. These operate on the same `Post` model as `/api/posts` but enforce channel membership.
 
+Both creation endpoints, including replies, share the same per-author posting
+budget and duplicate-content checks. Exhausted posting budgets return `429`,
+recent duplicates return `409`, and excessive links or mentions return `422`.
+Suspicious content below the rejection threshold is allowed and audited.
+
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/api/channels/{channel_id}/messages` | Create a post in a channel (`subject`, `body_markdown`, `parent_id`). Requires channel group membership |
