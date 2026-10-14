@@ -5,7 +5,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from stoa.models import Agent, Subscription
+from stoa.models import Agent, Comment, Post, Subscription
 from stoa.services import notifications
 from stoa.services.notifications import get_comment_recipients, get_new_post_recipients
 from tests.conftest import provision_channel
@@ -52,8 +52,6 @@ class TestNotificationEmailLinks:
         trailing_slashes: str,
         is_comment: bool,
     ) -> None:
-        from stoa.models import Comment, Post
-
         monkeypatch.setattr(
             notifications.settings,
             "public_base_url",
@@ -79,6 +77,113 @@ class TestNotificationEmailLinks:
             unsubscribe_url = "https://stoa.example.com/prefix/api/posts/42/subscribe"
             assert f'href="{unsubscribe_url}"' in html
             assert f"To unsubscribe, visit {unsubscribe_url} (DELETE)." in text
+
+
+class TestNotificationEmailEscaping:
+    @pytest.mark.parametrize("preview_source", ["comment", "post_body", "post_tldr"])
+    @pytest.mark.parametrize(
+        ("payload", "escaped"),
+        [
+            (
+                '<script>alert("XSS")</script>',
+                "&lt;script&gt;alert(&quot;XSS&quot;)&lt;/script&gt;",
+            ),
+            (
+                '<img src="x" onerror="alert(1)">',
+                "&lt;img src=&quot;x&quot; onerror=&quot;alert(1)&quot;&gt;",
+            ),
+            (
+                '<a href="javascript:alert(1)">link</a>',
+                "&lt;a href=&quot;javascript:alert(1)&quot;&gt;link&lt;/a&gt;",
+            ),
+            (
+                '<a href="data:text/html,<script>alert(1)</script>">link</a>',
+                "&lt;a href=&quot;data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;&quot;&gt;link&lt;/a&gt;",
+            ),
+            (
+                "Tom & \"friends\" <team> 'quote' &lt;b&gt;",
+                "Tom &amp; &quot;friends&quot; &lt;team&gt; &#x27;quote&#x27; &amp;lt;b&amp;gt;",
+            ),
+        ],
+        ids=["script", "image_handler", "javascript_link", "data_link", "special_characters"],
+    )
+    def test_dynamic_content_is_escaped_only_in_html(
+        self, preview_source: str, payload: str, escaped: str
+    ) -> None:
+        post = Post(
+            id=42,
+            subject=payload,
+            body_markdown=payload if preview_source == "post_body" else "Unused post body",
+            tldr=payload if preview_source == "post_tldr" else None,
+        )
+        if preview_source == "comment":
+            comment = Comment(post_id=post.id, body_markdown=payload)
+            html, text = notifications._comment_email_body(post, comment, payload, payload)
+        else:
+            html, text = notifications._new_post_email_body(post, payload, payload)
+
+        assert f"<strong>{escaped}</strong>" in html
+        assert f'>"{escaped}"</a>' in html
+        assert f"<blockquote>{escaped}</blockquote>" in html
+        assert f"You're receiving this because you {escaped}." in html
+        assert payload not in html
+        assert "Unused post body" not in html
+        assert f"by {payload}" in text
+        assert f'"{payload}"' in text
+        assert f"\n{payload}\n" in text
+        assert f"You're receiving this because you {payload}." in text
+        assert notifications._email_subject(post) == f'[Stoa] New activity on "{payload}"'
+
+    @pytest.mark.parametrize("preview_source", ["comment", "post_body", "post_tldr"])
+    def test_preview_is_truncated_before_escaping(self, preview_source: str) -> None:
+        preview = "<&\"'" * 50
+        body = preview + "omitted tail"
+        post = Post(
+            id=42,
+            subject="Discussion Topic",
+            body_markdown=body,
+            tldr=body if preview_source == "post_tldr" else None,
+        )
+        if preview_source == "comment":
+            comment = Comment(post_id=post.id, body_markdown=body)
+            html, text = notifications._comment_email_body(
+                post, comment, "bob@herd.ai", "authored this post"
+            )
+        else:
+            html, text = notifications._new_post_email_body(
+                post, "bob@herd.ai", "subscribed to this channel"
+            )
+
+        escaped_preview = "&lt;&amp;&quot;&#x27;" * 50
+        assert f"<blockquote>{escaped_preview}</blockquote>" in html
+        assert f"\n{preview}\n" in text
+        assert "omitted tail" not in html
+        assert "omitted tail" not in text
+
+    @pytest.mark.parametrize("is_comment", [False, True], ids=["new_post", "comment"])
+    def test_urls_are_escaped_in_html(
+        self, monkeypatch: pytest.MonkeyPatch, is_comment: bool
+    ) -> None:
+        base = "https://stoa.example.com/a&b\"c'd"
+        escaped_base = "https://stoa.example.com/a&amp;b&quot;c&#x27;d"
+        monkeypatch.setattr(notifications.settings, "public_base_url", base)
+        post = Post(id=42, subject="Discussion Topic", body_markdown="Post body")
+        if is_comment:
+            comment = Comment(post_id=post.id, body_markdown="Comment body")
+            html, text = notifications._comment_email_body(
+                post, comment, "bob@herd.ai", "authored this post"
+            )
+        else:
+            html, text = notifications._new_post_email_body(
+                post, "bob@herd.ai", "subscribed to this channel"
+            )
+
+        assert html.count(f'href="{escaped_base}/web/posts/42"') == 2
+        assert f"View: {base}/web/posts/42\n" in text
+        if is_comment:
+            escaped_unsub_url = f"{escaped_base}/api/posts/42/subscribe"
+            assert f'<a href="{escaped_unsub_url}">{escaped_unsub_url}</a>' in html
+            assert f"To unsubscribe, visit {base}/api/posts/42/subscribe (DELETE)." in text
 
 
 # --- Subscription endpoints ---
