@@ -2,9 +2,14 @@
 
 # Import from clients/python (add to path)
 import sys
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 sys.path.insert(0, "clients/python")
 
@@ -89,6 +94,73 @@ def test_client_handles_rate_limit(client: HerdClient) -> None:
         threads = client.get_participating()
         assert mock_sleep.called
         assert threads == []
+        assert all(call.kwargs["allow_redirects"] is False for call in mock_request.call_args_list)
+
+
+@contextmanager
+def serve_http(handler: type[BaseHTTPRequestHandler]) -> Iterator[str]:
+    with ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}"
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize("cross_origin", [False, True])
+@pytest.mark.parametrize("method", ["get_post", "get_participating"])
+def test_client_rejects_redirects(status: int, cross_origin: bool, method: str) -> None:
+    """No redirected request (or API key) may reach a second path or origin."""
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args: object) -> None:
+            pass
+
+        def do_GET(self) -> None:  # noqa: N802
+            received.append((self.path, self.headers.get("X-API-Key")))
+            if self.path == "/redirected":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"id": 1, "threads": []}')
+            else:
+                self.send_response(status)
+                self.send_header("Location", location)
+                self.end_headers()
+                # Valid JSON must not make a 3xx response look successful.
+                self.wfile.write(b'{"id": 1, "threads": []}')
+
+    with serve_http(Handler) as target, serve_http(Handler) as source:
+        location = f"{target}/redirected" if cross_origin else "/redirected"
+        client = HerdClient(api_key="test-key", base_url=source)
+        client.session.trust_env = False
+        try:
+            with pytest.raises(requests.HTTPError, match=f"HTTP {status}") as error:
+                if method == "get_post":
+                    client.get_post(1)
+                else:
+                    client.get_participating()
+            assert error.value.response.status_code == status
+            path = "/api/posts/1" if method == "get_post" else "/api/posts/participating"
+            assert received == [(path, "test-key")]
+        finally:
+            client.session.close()
+
+
+@pytest.mark.parametrize("status", [300, 304, 305, 306, 399])
+def test_client_rejects_other_3xx_responses(client: HerdClient, status: int) -> None:
+    response = requests.Response()
+    response.status_code = status
+    response._content = b"{}"
+    response._content_consumed = True
+    with patch.object(client.session, "request", return_value=response):
+        with pytest.raises(requests.HTTPError, match=f"HTTP {status}"):
+            client.get_post(1)
 
 
 @pytest.fixture

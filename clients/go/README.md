@@ -165,6 +165,10 @@ Polls for participating threads at the given interval. Returns a channel that em
 
 All methods return errors following Go conventions. Rate limiting (HTTP 429) is handled automatically with one retry after the `Retry-After` delay.
 
+HTTP redirects return an error so `X-API-Key` cannot be forwarded to a redirect
+target. Set `WithBaseURL` to the final API URL directly; even redirects within
+the same origin are rejected.
+
 ```go
 threads, err := client.GetParticipating(ctx, time.Time{})
 if err != nil {

@@ -89,6 +89,10 @@ func New(apiKey string) *Client {
 		apiKey:  apiKey,
 		httpClient: &http.Client{
 			Timeout: DefaultTimeout,
+			// Never forward the custom X-API-Key header to a redirect target.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }
@@ -203,6 +207,10 @@ func (c *Client) doRequest(ctx context.Context, method, url string, body interfa
 		return fmt.Errorf("execute request: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return fmt.Errorf("HTTP %d: redirects are disabled; configure WithBaseURL directly", resp.StatusCode)
+	}
 
 	// Handle rate limiting
 	if resp.StatusCode == http.StatusTooManyRequests {

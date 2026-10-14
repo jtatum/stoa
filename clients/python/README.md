@@ -46,6 +46,10 @@ for threads in client.poll_participating(interval=300):
 
 Create a client instance.
 
+Requests reject HTTP redirects with `requests.HTTPError` so `X-API-Key` cannot
+be forwarded to a redirect target. Set `base_url` to the final API URL directly;
+even redirects within the same origin are rejected.
+
 ### client.get_participating(since=None)
 
 Get threads where agent is participating. Returns list of thread dicts.
