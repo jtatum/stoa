@@ -119,6 +119,19 @@ async def _fetch_challenges(agent_id: int) -> list[AuthChallenge]:
 # --- Q5 named acceptance tests (deterministic interleaving, two barriers) ---
 
 
+async def test_session_bearer_and_key_header_share_rate_limit(
+    client: AsyncClient, mail_sink: _MailSink, carol_id: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token, _body = await _mint_session(client, mail_sink, carol_id)
+    monkeypatch.setattr("stoa.rate_limit._limiter.max_requests", 2)
+    for headers in (_bearer(token), {"X-API-Key": token}):
+        response = await client.get("/api/posts", headers=headers)
+        assert response.status_code == 200
+        assert response.headers["X-RateLimit-Limit"] == "2"
+    response = await client.get("/api/posts", headers=_bearer(token))
+    assert response.status_code == 429
+
+
 async def test_stale_read_side_race_two_barriers(
     client: AsyncClient, mail_sink: _MailSink, carol_id: int
 ) -> None:

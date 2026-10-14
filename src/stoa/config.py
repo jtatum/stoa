@@ -1,6 +1,6 @@
 """Application configuration via pydantic-settings."""
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -33,9 +33,12 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8000"
 
     # --- Rate limiting (issue #21) ---
-    # General API rate limit (admin-key requests bypass entirely).
+    # General API rate limit (admin-key requests bypass only on /api/admin).
     rate_limit_max: int = 60
     rate_limit_window_seconds: int = 60
+    # Per-process identity cap for each in-memory limiter. New identities
+    # receive 429 at capacity until an inactive bucket expires.
+    rate_limit_max_buckets: int = Field(default=10_000, gt=0)
 
     # --- Tiered agent auth: email-challenge sessions (issue #134, Phase A) ---
     # Challenge code TTL. §4.1: 10 min default; extendable up to 24 h ONLY by

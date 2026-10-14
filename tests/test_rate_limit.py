@@ -3,14 +3,116 @@
 import time
 from unittest.mock import patch
 
+import pytest
+from fastapi import Request
 from httpx import AsyncClient
 
-from stoa.rate_limit import RateLimiter, _identity_label, _is_admin_path, _parse_client_ip
+from stoa.auth import extract_api_credential
+from stoa.rate_limit import (
+    RateLimiter,
+    _extract_api_key,
+    _identity_label,
+    _is_admin_path,
+    _parse_client_ip,
+)
 
 HEADERS = {"X-API-Key": "alice-key"}
 
 
+@pytest.mark.parametrize(
+    ("x_api_key", "authorization", "expected"),
+    [
+        (None, None, None),
+        ("key", None, "key"),
+        ("key", "Bearer token", "token"),
+        ("key", "Bearer ", ""),
+        ("key", "Basic token", "key"),
+        ("key", "bearer token", "key"),
+        (None, "Basic token", None),
+    ],
+)
+def test_credential_selection(
+    x_api_key: str | None, authorization: str | None, expected: str | None
+) -> None:
+    assert extract_api_credential(x_api_key, authorization) == expected
+
+
+@pytest.mark.parametrize("header", ["x-api-key", "x-admin-key", "authorization"])
+def test_credential_identity_is_bounded_and_does_not_retain_secrets(header: str) -> None:
+    secret = "sensitive-credential-" * 1000
+    value = f"Bearer {secret}" if header == "authorization" else secret
+    request = Request({"type": "http", "headers": [(header.encode(), value.encode())]})
+    key = _extract_api_key(request)
+    assert key is not None
+    namespace, digest = key.split(":", 1)
+    assert namespace == ("admin" if header == "x-admin-key" else "api")
+    assert len(digest) == 64
+    assert secret[:8] not in key
+    assert _identity_label(key) == f"{namespace}:{digest[:12]}"
+    assert key == _extract_api_key(request)
+
+
 class TestRateLimiterUnit:
+    def test_unknown_identity_queries_do_not_allocate_buckets(self) -> None:
+        limiter = RateLimiter(max_requests=2, window_seconds=60)
+        for i in range(100):
+            assert limiter.remaining(f"unknown-{i}") == 2
+            assert limiter.retry_after(f"unknown-{i}") == 0
+        assert not limiter._requests
+
+    def test_inactive_buckets_expire_without_being_queried(self) -> None:
+        limiter = RateLimiter(max_requests=2, window_seconds=60)
+        with patch("stoa.rate_limit.time.monotonic", return_value=100):
+            for i in range(100):
+                assert limiter.is_allowed(f"old-{i}")
+        with patch("stoa.rate_limit.time.monotonic", return_value=160):
+            assert limiter.is_allowed("new")
+        assert list(limiter._requests) == ["new"]
+
+    def test_capacity_rejects_new_identities_without_resetting_active_limits(self) -> None:
+        limiter = RateLimiter(max_requests=2, window_seconds=60, max_buckets=2)
+        with patch("stoa.rate_limit.time.monotonic", return_value=100):
+            assert limiter.is_allowed("first")
+            assert limiter.is_allowed("second")
+            for i in range(100):
+                assert not limiter.is_allowed(f"overflow-{i}")
+                assert limiter.remaining(f"overflow-{i}") == 0
+                assert limiter.retry_after(f"overflow-{i}") == 60
+            assert limiter.is_allowed("first")
+            assert not limiter.is_allowed("first")
+            assert len(limiter._requests) == 2
+        with patch("stoa.rate_limit.time.monotonic", return_value=160):
+            assert limiter.is_allowed("new")
+            assert list(limiter._requests) == ["new"]
+
+    def test_cleanup_uses_last_accepted_request_and_preserves_sliding_window(self) -> None:
+        limiter = RateLimiter(max_requests=2, window_seconds=60, max_buckets=2)
+        with patch("stoa.rate_limit.time.monotonic", return_value=100):
+            assert limiter.is_allowed("active")
+            assert limiter.is_allowed("idle")
+        with patch("stoa.rate_limit.time.monotonic", return_value=130):
+            assert limiter.is_allowed("active")
+            assert not limiter.is_allowed("active")
+        with patch("stoa.rate_limit.time.monotonic", return_value=160):
+            assert limiter.is_allowed("new")
+            assert "idle" not in limiter._requests
+            assert limiter.remaining("active") == 1
+            assert limiter.retry_after("active") == 30
+            assert limiter.is_allowed("active")
+            assert not limiter.is_allowed("active")
+
+    def test_capacity_retry_waits_for_a_whole_bucket_to_expire(self) -> None:
+        limiter = RateLimiter(max_requests=2, window_seconds=60, max_buckets=1)
+        with patch("stoa.rate_limit.time.monotonic", return_value=100):
+            assert limiter.is_allowed("active")
+        with patch("stoa.rate_limit.time.monotonic", return_value=130):
+            assert limiter.is_allowed("active")
+        with patch("stoa.rate_limit.time.monotonic", return_value=160):
+            assert not limiter.is_allowed("new")
+            assert limiter.retry_after("new") == 30
+        with patch("stoa.rate_limit.time.monotonic", return_value=190):
+            assert limiter.is_allowed("new")
+
     def test_allows_requests_under_limit(self) -> None:
         limiter = RateLimiter(max_requests=5, window_seconds=60)
         for _ in range(5):
@@ -46,6 +148,69 @@ class TestRateLimiterUnit:
 
 
 class TestRateLimitMiddleware:
+    async def test_bearer_and_key_header_share_a_limit(
+        self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("stoa.rate_limit._limiter.max_requests", 2)
+        for headers in (HEADERS, {"Authorization": "Bearer alice-key"}):
+            response = await client.get("/api/posts", headers=headers)
+            assert response.status_code == 200
+            assert response.headers["X-RateLimit-Limit"] == "2"
+        for headers in (HEADERS, {"Authorization": "Bearer alice-key"}):
+            response = await client.get("/api/posts", headers=headers)
+            assert response.status_code == 429
+
+    async def test_bearer_precedence_prevents_decoy_header_rotation(
+        self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("stoa.rate_limit._limiter.max_requests", 2)
+        for i in range(4):
+            response = await client.get(
+                "/api/posts",
+                headers={
+                    "Authorization": "Bearer alice-key",
+                    "X-API-Key": f"decoy-{i}",
+                    "X-Admin-Key": f"decoy-admin-{i}",
+                },
+            )
+            assert response.status_code == (200 if i < 2 else 429)
+        # Bob's independent credential still has its own allowance.
+        assert (await client.get("/api/posts", headers={"X-API-Key": "bob-key"})).status_code == 200
+
+    @pytest.mark.parametrize("header", ["X-API-Key", "X-Admin-Key", "Authorization"])
+    async def test_public_key_header_rotation_cannot_replace_ip_limit(
+        self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch, header: str
+    ) -> None:
+        monkeypatch.setattr("stoa.rate_limit._limiter.max_requests", 2)
+        assert (await client.get("/api/public/pinned")).status_code == 200
+        for i in range(3):
+            value = f"Bearer arbitrary-{i}" if header == "Authorization" else f"arbitrary-{i}"
+            response = await client.get("/api/public/pinned", headers={header: value})
+            assert response.status_code == (200 if i == 0 else 429)
+        response = await client.get(
+            "/api/public/pinned",
+            headers={header: value, "Fly-Client-IP": "203.0.113.9"},
+        )
+        assert response.status_code == 200
+
+    async def test_bucket_capacity_returns_429_with_retry_after(self, client: AsyncClient) -> None:
+        limiter = RateLimiter(max_requests=2, window_seconds=60, max_buckets=1)
+        with patch("stoa.rate_limit._limiter", limiter):
+            assert (await client.get("/api/posts", headers=HEADERS)).status_code == 200
+            response = await client.get("/api/posts", headers={"X-API-Key": "bob-key"})
+            assert response.status_code == 429
+            assert 0 < int(response.headers["Retry-After"]) <= 60
+            assert response.headers["X-RateLimit-Remaining"] == "0"
+
+    async def test_api_key_cannot_claim_admin_namespace(
+        self, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("stoa.rate_limit._limiter.max_requests", 1)
+        headers = {"X-API-Key": "admin:forged"}
+        response = await client.get("/api/admin/stats", headers=headers)
+        assert "X-RateLimit-Limit" in response.headers
+        assert (await client.get("/api/admin/stats", headers=headers)).status_code == 429
+
     async def test_normal_requests_succeed(self, client: AsyncClient) -> None:
         response = await client.get("/api/posts", headers=HEADERS)
         assert response.status_code == 200
@@ -107,20 +272,18 @@ class TestAdminBypassScope:
         assert _is_admin_path("/api/posts") is False
         assert _is_admin_path("/") is False
 
-    def test_identity_label_keeps_agent_prefix(self) -> None:
-        assert _identity_label("alice-key-123456") == "alice-ke"
-
     def test_identity_label_does_not_leak_admin_key(self) -> None:
         """Admin labels must be non-reversible — they now reach audit records."""
         secret = "test-admin-key-that-is-long-enough-for-validation"
-        label = _identity_label(f"admin:{secret}")
+        request = Request({"type": "http", "headers": [(b"x-admin-key", secret.encode())]})
+        key = _extract_api_key(request)
+        assert key is not None
+        label = _identity_label(key)
         assert label.startswith("admin:")
         assert secret not in label
         assert secret[:8] not in label
         # Stable across calls, so operators can correlate requests.
-        assert label == _identity_label(f"admin:{secret}")
-        # Distinct keys get distinct labels.
-        assert label != _identity_label("admin:some-other-admin-key-entirely")
+        assert label == _identity_label(key)
 
     async def test_admin_key_bypasses_on_admin_path(
         self, client: AsyncClient, admin_headers: dict
