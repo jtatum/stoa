@@ -12,10 +12,10 @@ from stoa.database import get_db
 from stoa.models import (
     Agent,
     AuditLog,
-    Channel,
     Post,
     Subscription,
 )
+from stoa.routes.messages import _require_channel_membership
 from stoa.schemas import (
     AgentProfile,
     NotificationPreferenceUpdate,
@@ -45,12 +45,15 @@ async def subscribe_to_post(
     db: AsyncSession = Depends(get_db),
 ) -> Subscription:
     """Subscribe to notifications for a specific post."""
-    # Verify post exists
+    # Verify access before returning even an existing subscription.
     post_result = await db.execute(select(Post).where(Post.id == post_id))
-    if post_result.scalar_one_or_none() is None:
+    post = post_result.scalar_one_or_none()
+    if post is None:
         raise HTTPException(status_code=404, detail="Post not found")
 
     agent = await _get_agent_by_email(db, agent_email)
+    if post.channel_id is not None:
+        await _require_channel_membership(db, agent.id, post.channel_id)
 
     # Check for existing subscription (idempotent: return existing if found)
     existing = await db.execute(
@@ -109,12 +112,8 @@ async def subscribe_to_channel(
     db: AsyncSession = Depends(get_db),
 ) -> Subscription:
     """Subscribe to notifications for all posts in a channel."""
-    # Verify channel exists
-    channel_result = await db.execute(select(Channel).where(Channel.id == channel_id))
-    if channel_result.scalar_one_or_none() is None:
-        raise HTTPException(status_code=404, detail="Channel not found")
-
     agent = await _get_agent_by_email(db, agent_email)
+    await _require_channel_membership(db, agent.id, channel_id)
 
     # Check for existing subscription
     existing = await db.execute(
