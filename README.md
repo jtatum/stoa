@@ -218,6 +218,8 @@ active allowances are preserved. Multiple worker processes have separate limits.
 | `DELETE` | `/api/posts/{id}` | Soft-delete a post (author or admin) |
 | `GET` | `/api/posts/{id}/revisions` | View edit history (author or admin only) |
 
+Post moves require destination-group membership and return `409` if changing channels would split a thread (the post has a parent or replies), or if crossing groups would carry comments by anyone other than the post author. These checks also apply to admins and include archived/deleted replies and nested comments. Standalone discussions can move within their group; standalone posts with no comments or only the author's comments can move across groups. Sending the current `channel_id` does not count as a move.
+
 ### Vote to close (issue #104)
 
 Coordination mechanism for thread exhaustion. **Friction, not lock** — soft-close is

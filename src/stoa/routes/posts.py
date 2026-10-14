@@ -15,6 +15,7 @@ from stoa.constants import HIDDEN_POST_STATUSES
 from stoa.database import get_db
 from stoa.models import (
     AuditLog,
+    Channel,
     Comment,
     Post,
     PostRevision,
@@ -49,6 +50,39 @@ from stoa.services.post_visibility import agent_post_access_filter, agent_visibl
 router = APIRouter(prefix="/api/posts", tags=["posts"])
 
 MAX_SUBJECT_CHARS = 320
+
+
+async def _require_safe_post_move(db: AsyncSession, post: Post, destination: Channel) -> None:
+    """Keep connected posts together and preserve other commenters' group boundary."""
+    if post.channel_id == destination.id:
+        return
+
+    # This endpoint moves one post, so neither replies nor posts with replies
+    # can change channels. Include archived/deleted replies: they still belong
+    # to the thread and may later be restored.
+    if post.parent_post_id is not None or await db.scalar(
+        select(select(Post.id).where(Post.parent_post_id == post.id).exists())
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot move an individual post in a thread to another channel",
+        )
+
+    source_group_id = await db.scalar(select(Channel.group_id).where(Channel.id == post.channel_id))
+    if source_group_id != destination.group_id and await db.scalar(
+        select(
+            select(Comment.id)
+            .where(Comment.post_id == post.id, Comment.author != post.author)
+            .exists()
+        )
+    ):
+        # Destination membership (even for all current participants) is not
+        # consent to disclose their comments to a different group's audience.
+        # A legacy post without a source channel also has no matching group.
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot move a post with other participants' comments across groups",
+        )
 
 
 def _utcnow_naive() -> datetime:
@@ -363,6 +397,8 @@ async def manage_post(
 
     Author with post access can: archive (status='archived'), move (channel_id).
     Admin can: archive, move, pin/unpin, and set status to 'deleted' (soft delete).
+    Moves cannot split a post thread or carry other participants' comments
+    across groups, including when performed by an admin.
     """
     result = await db.execute(select(Post).where(Post.id == post_id))
     post = result.scalar_one_or_none()
@@ -383,6 +419,10 @@ async def manage_post(
     if not is_admin:
         await require_post_access(db, agent_email, post)
 
+    if body.channel_id is not None:
+        destination = await require_channel_access(db, agent_email, body.channel_id)
+        await _require_safe_post_move(db, post, destination)
+
     audit_details: dict[str, object] = {"post_id": post_id}
     actor_role = "admin" if is_admin else "author"
 
@@ -398,8 +438,6 @@ async def manage_post(
 
     # --- Move (change channel_id) ---
     if body.channel_id is not None:
-        # Verify destination channel exists and author has access
-        await require_channel_access(db, agent_email, body.channel_id)
         old_channel_id = post.channel_id
         post.channel_id = body.channel_id
         audit_details["old_channel_id"] = old_channel_id
