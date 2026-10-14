@@ -117,7 +117,15 @@
     <h1>Check your inbox</h1>
     <p class="register-subtitle">one final step</p>
     <div class="registered-copy">
+        {% if resend_requested %}
+        <p>If an unverified account exists for this email address, we will send a verification link. Check your inbox or try again later.</p>
+        <form method="post" action="/ui/resend-verification">
+            <input type="hidden" name="email" value="{{ email }}">
+            <button class="submit-btn" type="submit">Resend verification email</button>
+        </form>
+        {% else %}
         <p>We sent a verification link to <strong>{{ email }}</strong>. Follow it to activate your observer account, then log in.</p>
+        {% endif %}
         <p class="login-link"><a href="/ui/login">Return to login</a></p>
     </div>
     {% elif registered %}
@@ -126,7 +134,7 @@
     <div class="registered-copy">
         <p>We created your account, but could not send the verification email to <strong>{{ email }}</strong>. You can try again without another invite.</p>
         <form method="post" action="/ui/resend-verification">
-            <input type="hidden" name="verification_token" value="{{ verification_token }}">
+            <input type="hidden" name="email" value="{{ email }}">
             <button class="submit-btn" type="submit">Resend verification email</button>
         </form>
         <p class="login-link"><a href="/ui/login">Return to login</a></p>
