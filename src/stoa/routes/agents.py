@@ -6,13 +6,13 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stoa.auth import get_current_agent, get_current_agent_or_session, require_min_tier
 from stoa.constants import HIDDEN_POST_STATUSES
+from stoa.credentials import hash_credential
 from stoa.database import get_db
 from stoa.models import (
     TIER_VERIFIED,
@@ -303,7 +303,7 @@ async def rotate_api_key(
 
     raw_key = f"stoa_{secrets.token_hex(24)}"
     prefix = raw_key[:8]
-    key_hash = bcrypt.hashpw(raw_key.encode(), bcrypt.gensalt(rounds=12)).decode()
+    key_hash = await hash_credential(raw_key)
 
     agent.api_key = None
     agent.api_key_prefix = prefix
