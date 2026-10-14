@@ -49,8 +49,10 @@ EMPTY_DASHBOARD = {
 class FakeStoa:
     """A local Stoa stand-in. Routes are a dict of path -> JSON body or int status."""
 
-    def __init__(self, routes):
+    def __init__(self, routes, redirects=None):
         self.routes = dict(routes)
+        self.redirects = redirects or {}
+        self.requests = []
         self.acks = 0
         outer = self
 
@@ -66,7 +68,21 @@ class FakeStoa:
                 self.end_headers()
                 self.wfile.write(data)
 
+            def _redirect(self):
+                outer.requests.append((self.command, self.path, self.headers.get("X-API-Key")))
+                redirect = outer.redirects.get(self.path)
+                if redirect is None:
+                    return False
+                status, location = redirect
+                self.send_response(status)
+                self.send_header("Location", location)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return True
+
             def do_GET(self):
+                if self._redirect():
+                    return
                 body = outer.routes.get(self.path, [])
                 if isinstance(body, int):
                     self._send({"detail": "forced failure"}, status=body)
@@ -74,6 +90,8 @@ class FakeStoa:
                     self._send(body)
 
             def do_POST(self):
+                if self._redirect():
+                    return
                 if self.path == "/api/me/dashboard/seen":
                     outer.acks += 1
                     self._send({"seen_at": "2026-01-01T00:00:00Z"})
@@ -82,12 +100,15 @@ class FakeStoa:
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
         self.thread.start()
 
     def close(self):
         self.server.shutdown()
         self.server.server_close()
+        self.thread.join()
 
 
 def dashboard(**overrides):
@@ -109,8 +130,10 @@ class EndToEnd(unittest.TestCase):
             self.stoa.close()
         self.tmp.cleanup()
 
-    def run_checker(self, routes, env_overrides=None, base_url=None):
-        self.stoa = FakeStoa(routes)
+    def run_checker(self, routes, env_overrides=None, base_url=None, redirects=None):
+        if self.stoa is not None:
+            self.stoa.close()
+        self.stoa = FakeStoa(routes, redirects=redirects)
         env = {
             "PATH": os.environ.get("PATH", ""),
             "STOA_BASE_URL": base_url or self.stoa.url,
@@ -236,6 +259,37 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertEqual(self.stoa.acks, 0)
 
+    def test_redirects_never_forward_credentials_or_advance_watermark(self):
+        target = FakeStoa({"/redirected": dashboard()})
+        self.addCleanup(target.close)
+        watermark = self.state / "dashboard-watermark.json"
+        original_watermark = '{"channels": {"5": "2026-01-01T00:00:00Z"}}'
+        watermark.write_text(original_watermark)
+        for status in (301, 302, 303, 307, 308):
+            for cross_origin in (False, True):
+                for path in ("/api/me/dashboard", "/api/me/dashboard/seen"):
+                    with self.subTest(status=status, cross_origin=cross_origin, path=path):
+                        location = f"{target.url}/redirected" if cross_origin else "/redirected"
+                        proc, digest = self.run_checker(
+                            {"/api/me/dashboard": dashboard(), "/redirected": dashboard()},
+                            redirects={path: (status, location)},
+                        )
+                        self.assertEqual(target.requests, [])
+                        expected_requests = [("GET", "/api/me/dashboard", "test-key")]
+                        if path.endswith("/seen"):
+                            expected_requests.append(("POST", path, "test-key"))
+                        self.assertEqual(self.stoa.requests, expected_requests)
+                        self.assertEqual(self.stoa.acks, 0)
+                        self.assertEqual(watermark.read_text(), original_watermark)
+                        if path.endswith("/seen"):
+                            # Preserve the existing ack-failure contract: warn,
+                            # retain the watermark, and report window activity.
+                            self.assertEqual(proc.returncode, 1, proc.stderr)
+                            self.assertIn(f"HTTP Error {status}", proc.stderr)
+                        else:
+                            self.assertEqual(proc.returncode, 3, proc.stderr)
+                            self.assertTrue(any(f"HTTP {status}" in e for e in digest["errors"]))
+
 
 class ImportedChecker(unittest.TestCase):
     """Import the checker with isolated state and a localhost base URL."""
@@ -333,7 +387,7 @@ class SweepUnit(ImportedChecker):
         output = io.StringIO()
         with (
             patch.dict(os.environ, {"STOA_API_KEY": "test-key", "STOA_AGENT_EMAIL": email}),
-            patch.object(self.mod.urllib.request, "urlopen", side_effect=urlopen),
+            patch.object(self.mod._API_OPENER, "open", side_effect=urlopen),
             redirect_stdout(output),
             self.assertRaises(SystemExit) as exited,
         ):
@@ -447,7 +501,7 @@ class SweepUnit(ImportedChecker):
                 self.assertFalse(self.mod.WATERMARK_PATH.exists())
 
     def test_ack_returns_false_on_request_or_transport_failure(self):
-        with patch.object(self.mod.urllib.request, "urlopen", side_effect=OSError("offline")):
+        with patch.object(self.mod._API_OPENER, "open", side_effect=OSError("offline")):
             self.assertIs(self.mod.ack_dashboard_seen("test-key", "2026-01-01T12:00:00Z"), False)
         with patch.object(self.mod.urllib.request, "Request", side_effect=ValueError("bad URL")):
             self.assertIs(self.mod.ack_dashboard_seen("test-key", "2026-01-01T12:00:00Z"), False)

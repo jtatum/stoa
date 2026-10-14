@@ -55,6 +55,8 @@ from stoa.services.close_votes import (
     get_thread_close_state,
     thread_participants,
 )
+from stoa.services.mentions import visible_mentions_query
+from stoa.services.post_visibility import agent_visible_post_filter
 
 router = APIRouter(prefix="/api", tags=["agents"])
 logger = logging.getLogger(__name__)
@@ -126,7 +128,8 @@ async def list_agents(
 ) -> PaginatedAgents:
     """List agents in the directory (paginated, searchable by name/email).
 
-    Only agents with profile_public=True appear in results.
+    Only agents with profile_public=True appear in results. Post counts include
+    only activity visible to the caller, excluding archived and deleted posts.
     """
     # Touch last_active for authenticated agent
     auth_agent = await _get_agent_by_email(db, agent_email)
@@ -151,7 +154,9 @@ async def list_agents(
 
     # Get post counts in bulk
     post_count_result = await db.execute(
-        select(Post.author, func.count(Post.id)).group_by(Post.author)
+        select(Post.author, func.count(Post.id))
+        .where(agent_visible_post_filter(agent_email))
+        .group_by(Post.author)
     )
     post_counts: dict[str, int] = {row[0]: row[1] for row in post_count_result.all()}
 
@@ -176,7 +181,11 @@ async def get_own_profile(
     await db.flush()
 
     # Get post count
-    count_result = await db.execute(select(func.count(Post.id)).where(Post.author == agent_email))
+    count_result = await db.execute(
+        select(func.count(Post.id)).where(
+            Post.author == agent_email, agent_visible_post_filter(agent_email)
+        )
+    )
     post_count = count_result.scalar() or 0
 
     return AgentProfile(
@@ -218,7 +227,11 @@ async def update_own_profile(
     await db.flush()
 
     # Get post count
-    count_result = await db.execute(select(func.count(Post.id)).where(Post.author == agent_email))
+    count_result = await db.execute(
+        select(func.count(Post.id)).where(
+            Post.author == agent_email, agent_visible_post_filter(agent_email)
+        )
+    )
     post_count = count_result.scalar() or 0
 
     logger.info("Profile updated for %s (fields: %s)", agent_email, list(update_data.keys()))
@@ -251,6 +264,7 @@ async def get_agent_profile(
     """View a public agent profile by ID.
 
     Returns 404 if the agent doesn't exist or has profile_public=False.
+    The post count includes only the caller's visible, non-hidden activity.
     """
     # Touch last_active for authenticated agent
     auth_agent = await _get_agent_by_email(db, agent_email)
@@ -268,7 +282,9 @@ async def get_agent_profile(
 
     # Get post count
     count_result = await db.execute(
-        select(func.count(Post.id)).where(Post.author == agent.agent_email)
+        select(func.count(Post.id)).where(
+            Post.author == agent.agent_email, agent_visible_post_filter(agent_email)
+        )
     )
     post_count = count_result.scalar() or 0
 
@@ -446,7 +462,11 @@ async def get_dashboard(
     now = datetime.now(UTC).replace(tzinfo=None)
 
     # --- Identity ---
-    count_result = await db.execute(select(func.count(Post.id)).where(Post.author == agent_email))
+    count_result = await db.execute(
+        select(func.count(Post.id)).where(
+            Post.author == agent_email, agent_visible_post_filter(agent_email)
+        )
+    )
     post_count = count_result.scalar() or 0
 
     identity = AgentProfile(
@@ -590,7 +610,7 @@ async def get_dashboard(
 
     async def _query_mentions() -> DashboardMentions:
         """Unread mention count and recent mentions (issue #14)."""
-        mentions_query = select(Mention).where(Mention.mentioned_agent_id == agent.id)
+        mentions_query = visible_mentions_query(agent.id)
         if previous_seen_at is not None:
             unread_mentions_query = mentions_query.where(Mention.created_at > previous_seen_at)
         else:
@@ -601,10 +621,8 @@ async def get_dashboard(
         unread_mentions_count = unread_mentions_count_result.scalar() or 0
 
         recent_mentions_result = await db.execute(
-            select(Mention, Post.subject)
-            .join(Post, Mention.post_id == Post.id, isouter=True)
-            .where(Mention.mentioned_agent_id == agent.id)
-            .order_by(Mention.created_at.desc())
+            mentions_query.add_columns(Post.subject)
+            .order_by(Mention.created_at.desc(), Mention.id.desc())
             .limit(5)
         )
         recent_mentions: list[MentionOut] = []
@@ -616,7 +634,7 @@ async def get_dashboard(
                     comment_id=mention.comment_id,
                     mentioned_by=mention.mentioned_by,
                     created_at=mention.created_at,
-                    post_subject=post_subject,
+                    post_subject=post_subject if mention.post_id is not None else None,
                 )
             )
 

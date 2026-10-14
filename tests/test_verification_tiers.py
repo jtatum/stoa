@@ -17,7 +17,9 @@ ALICE = {"X-API-Key": "alice-key"}  # Tier 2 (vouched)
 BOB = {"X-API-Key": "bob-key"}  # Tier 2 (vouched)
 
 
-async def _register_verified_tier1(client: AsyncClient, make_invite, email: str) -> dict:
+async def _register_verified_tier1(
+    client: AsyncClient, make_invite, verification_email, email: str
+) -> dict:
     """Register + email-verify an agent, returning its Tier-1 auth headers + id."""
     code = await make_invite()
     reg = await client.post(
@@ -27,7 +29,7 @@ async def _register_verified_tier1(client: AsyncClient, make_invite, email: str)
     assert reg.status_code == 201, reg.text
     body = reg.json()
     api_key = body["api_key"]
-    token = body["verification_token"]
+    token = verification_email.await_args.kwargs["token"]
 
     verify = await client.get(f"/auth/verify/{token}")
     assert verify.status_code == 200
@@ -41,23 +43,27 @@ async def _register_verified_tier1(client: AsyncClient, make_invite, email: str)
 
 
 @pytest.mark.anyio
-async def test_verify_promotes_to_tier1(client: AsyncClient, make_invite):
+async def test_verify_promotes_to_tier1(client: AsyncClient, make_invite, verification_email):
     """Email verification moves an agent from Tier 0 to Tier 1."""
-    await _register_verified_tier1(client, make_invite, "tier1@example.com")
+    await _register_verified_tier1(client, make_invite, verification_email, "tier1@example.com")
 
 
 @pytest.mark.anyio
-async def test_tier1_cannot_mint_invite(client: AsyncClient, make_invite):
+async def test_tier1_cannot_mint_invite(client: AsyncClient, make_invite, verification_email):
     """A merely-verified (Tier 1) agent cannot mint invites (#20 tightened #19)."""
-    agent = await _register_verified_tier1(client, make_invite, "mintless@example.com")
+    agent = await _register_verified_tier1(
+        client, make_invite, verification_email, "mintless@example.com"
+    )
     resp = await client.post("/api/agents/me/invites", headers=agent["headers"])
     assert resp.status_code == 403
 
 
 @pytest.mark.anyio
-async def test_tier1_cannot_create_group(client: AsyncClient, make_invite):
+async def test_tier1_cannot_create_group(client: AsyncClient, make_invite, verification_email):
     """A Tier-1 agent cannot create groups; Tier 2 is required."""
-    agent = await _register_verified_tier1(client, make_invite, "nogroup@example.com")
+    agent = await _register_verified_tier1(
+        client, make_invite, verification_email, "nogroup@example.com"
+    )
     resp = await client.post(
         "/api/groups",
         json={"name": "Should Fail", "description": "nope"},
@@ -67,9 +73,11 @@ async def test_tier1_cannot_create_group(client: AsyncClient, make_invite):
 
 
 @pytest.mark.anyio
-async def test_two_vouches_promote_to_tier2(client: AsyncClient, make_invite):
+async def test_two_vouches_promote_to_tier2(client: AsyncClient, make_invite, verification_email):
     """Two distinct Tier-2 vouches auto-promote the target to Tier 2."""
-    carol = await _register_verified_tier1(client, make_invite, "carol@example.com")
+    carol = await _register_verified_tier1(
+        client, make_invite, verification_email, "carol@example.com"
+    )
     cid = carol["id"]
 
     # First vouch (alice) -> count 1, not yet promoted.
@@ -94,9 +102,11 @@ async def test_two_vouches_promote_to_tier2(client: AsyncClient, make_invite):
 
 
 @pytest.mark.anyio
-async def test_duplicate_vouch_is_idempotent(client: AsyncClient, make_invite):
+async def test_duplicate_vouch_is_idempotent(client: AsyncClient, make_invite, verification_email):
     """The same voucher vouching twice does not double-count or promote."""
-    dave = await _register_verified_tier1(client, make_invite, "dave@example.com")
+    dave = await _register_verified_tier1(
+        client, make_invite, verification_email, "dave@example.com"
+    )
     did = dave["id"]
 
     r1 = await client.post(f"/api/agents/{did}/vouch", headers=ALICE)
@@ -118,18 +128,26 @@ async def test_cannot_vouch_for_self(client: AsyncClient):
 
 
 @pytest.mark.anyio
-async def test_tier1_cannot_vouch(client: AsyncClient, make_invite):
+async def test_tier1_cannot_vouch(client: AsyncClient, make_invite, verification_email):
     """A Tier-1 agent cannot vouch for others (voucher must be Tier 2)."""
-    voucher = await _register_verified_tier1(client, make_invite, "wannabe@example.com")
-    target = await _register_verified_tier1(client, make_invite, "target@example.com")
+    voucher = await _register_verified_tier1(
+        client, make_invite, verification_email, "wannabe@example.com"
+    )
+    target = await _register_verified_tier1(
+        client, make_invite, verification_email, "target@example.com"
+    )
     resp = await client.post(f"/api/agents/{target['id']}/vouch", headers=voucher["headers"])
     assert resp.status_code == 403
 
 
 @pytest.mark.anyio
-async def test_cannot_vouch_unverified_agent(client: AsyncClient, make_invite, admin_headers):
+async def test_cannot_vouch_unverified_agent(
+    client: AsyncClient, make_invite, admin_headers, verification_email
+):
     """Vouching for a Tier-0 (unverified) agent is rejected with 409."""
-    agent = await _register_verified_tier1(client, make_invite, "downgrade@example.com")
+    agent = await _register_verified_tier1(
+        client, make_invite, verification_email, "downgrade@example.com"
+    )
     # Force back to Tier 0 to simulate an unverified target.
     reset = await client.post(
         f"/api/admin/agents/{agent['id']}/tier",
@@ -150,9 +168,13 @@ async def test_vouch_nonexistent_agent_404(client: AsyncClient):
 
 
 @pytest.mark.anyio
-async def test_admin_can_set_tier(client: AsyncClient, make_invite, admin_headers):
+async def test_admin_can_set_tier(
+    client: AsyncClient, make_invite, admin_headers, verification_email
+):
     """Admin can set an agent's tier directly (bootstrap seeding)."""
-    agent = await _register_verified_tier1(client, make_invite, "seedme@example.com")
+    agent = await _register_verified_tier1(
+        client, make_invite, verification_email, "seedme@example.com"
+    )
     resp = await client.post(
         f"/api/admin/agents/{agent['id']}/tier",
         json={"verification_tier": 2},

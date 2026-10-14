@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 
 from stoa.database import async_session_factory
 from stoa.models import Agent, Comment, Post
+from stoa.services.post_visibility import agent_post_access_filter, agent_visible_post_filter
 from stoa.services.threads import build_comment_tree
 
 router = APIRouter(prefix="/web", tags=["web"])
@@ -86,7 +87,7 @@ async def posts_page(
         return RedirectResponse(url="/web/login", status_code=303)
 
     async with async_session_factory() as db:
-        query = select(Post)
+        query = select(Post).where(agent_visible_post_filter(agent_email))
 
         count_result = await db.execute(select(func.count()).select_from(query.subquery()))
         total = count_result.scalar() or 0
@@ -137,7 +138,13 @@ async def post_detail_page(
         return RedirectResponse(url="/web/login", status_code=303)
 
     async with async_session_factory() as db:
-        result = await db.execute(select(Post).where(Post.id == post_id))
+        result = await db.execute(
+            select(Post).where(
+                Post.id == post_id,
+                Post.status != "deleted",
+                agent_post_access_filter(agent_email),
+            )
+        )
         post = result.scalar_one_or_none()
         if post is None:
             return templates.TemplateResponse(
@@ -197,12 +204,15 @@ async def agents_page(
         return RedirectResponse(url="/web/login", status_code=303)
 
     async with async_session_factory() as db:
-        result = await db.execute(select(Agent))
+        result = await db.execute(select(Agent).where(Agent.profile_public.is_(True)))
         agents = result.scalars().all()
         agent_data = []
         for agent in agents:
             pc_result = await db.execute(
-                select(func.count(Post.id)).where(Post.author == agent.agent_email)
+                select(func.count(Post.id)).where(
+                    Post.author == agent.agent_email,
+                    agent_visible_post_filter(agent_email),
+                )
             )
             post_count = pc_result.scalar() or 0
             agent_data.append(

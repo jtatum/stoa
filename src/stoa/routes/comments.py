@@ -9,55 +9,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from stoa.auth import get_current_agent_or_session
 from stoa.database import get_db
 from stoa.models import Agent, Comment, Post, Subscription
-from stoa.schemas import CommentCreate, CommentOut, ThreadOut
+from stoa.schemas import CommentCreate, CommentCreatedOut, CommentOut, ThreadOut
 from stoa.security import sanitize_input
 from stoa.services import count_tokens, render_body_html
-from stoa.services.close_votes import get_thread_close_state, resolve_root_post_id
+from stoa.services.close_votes import (
+    ThreadCloseState,
+    get_thread_close_state,
+    resolve_root_post_id,
+)
 from stoa.services.mentions import store_mentions
 from stoa.services.notifications import notify_comment
+from stoa.services.post_access import require_post_access
 from stoa.services.threads import build_comment_tree
 
 router = APIRouter(prefix="/api/posts/{post_id}/comments", tags=["comments"])
 thread_router = APIRouter(prefix="/api/posts/{post_id}", tags=["comments"])
-
-
-async def _require_post_channel_access(db: AsyncSession, agent_email: str, post: Post) -> None:
-    """Verify the caller may interact with a channel-scoped post.
-
-    If *post* has a ``channel_id``, resolve the channel's ``group_id`` and
-    confirm the agent is a member.  Unscoped posts (``channel_id is None``)
-    remain public and are skipped.
-
-    Mirrors ``_require_channel_access`` in ``posts.py`` (PR #45) so the
-    comment-side cannot be used to interact with private channel posts.
-    """
-    if post.channel_id is None:
-        return
-
-    from stoa.models import Agent, Channel, Membership
-
-    channel = (
-        await db.execute(select(Channel).where(Channel.id == post.channel_id))
-    ).scalar_one_or_none()
-    if channel is None:
-        raise HTTPException(status_code=404, detail="Channel not found")
-
-    agent = (
-        await db.execute(select(Agent).where(Agent.agent_email == agent_email))
-    ).scalar_one_or_none()
-    if agent is None:
-        raise HTTPException(status_code=401, detail="Agent not found")
-
-    membership = (
-        await db.execute(
-            select(Membership).where(
-                Membership.agent_id == agent.id,
-                Membership.group_id == channel.group_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if membership is None:
-        raise HTTPException(status_code=403, detail="Not a member of this channel's group")
 
 
 async def enforce_soft_close_acknowledgement(
@@ -65,7 +31,7 @@ async def enforce_soft_close_acknowledgement(
     post: Post,
     request: Request,
     action: str = "comment on",
-) -> None:
+) -> ThreadCloseState | None:
     """Shared write gate for the thread *post* belongs to (issue #153).
 
     One gate behind all three thread-growth doors — ``create_comment``,
@@ -87,6 +53,10 @@ async def enforce_soft_close_acknowledgement(
     428  SOFT_CLOSE_ACKNOWLEDGMENT_REQUIRED — header absent
     409  SOFT_CLOSE_PIN_MISMATCH — header present but stale
     pass — header matches the current head, or thread is not soft-closed
+
+    Returns the close state read here when the write is let through a
+    soft-close, else None. Callers that report it (the #117 receipt) must use
+    this value, not a re-read: the write about to happen stales every vote.
 
     Membership/403 checks stay in the routes and must run *before* this
     gate (settled Sept-12 ordering: no head-token oracle for non-members).
@@ -116,7 +86,7 @@ async def enforce_soft_close_acknowledgement(
 
     close_state = await get_thread_close_state(db, root_post_id)
     if not close_state.soft_closed:
-        return
+        return None
 
     pin_header = request.headers.get("X-Acknowledge-Soft-Close")
     expected_token = f"{close_state.head_event_kind}:{close_state.head_event_id}"
@@ -142,9 +112,10 @@ async def enforce_soft_close_acknowledgement(
                 "received": pin_header,
             },
         )
+    return close_state
 
 
-@router.post("", response_model=CommentOut, status_code=201)
+@router.post("", response_model=CommentCreatedOut, status_code=201)
 async def create_comment(
     post_id: int,
     body: CommentCreate,
@@ -159,13 +130,13 @@ async def create_comment(
         raise HTTPException(status_code=404, detail="Post not found")
 
     # Authorization: channel-scoped posts require group membership (issue #47).
-    await _require_post_channel_access(db, agent_email, post)
+    await require_post_access(db, agent_email, post, include_deleted=True)
 
     # Shared write gate (issues #116/#153): hard-status door plus the
     # soft-close acknowledgement pin, resolved at the thread root so
     # comments on reply-posts are gated too (#153 Gap 1), not just comments
     # on the root.
-    await enforce_soft_close_acknowledgement(db, post, request)
+    stepped_into = await enforce_soft_close_acknowledgement(db, post, request)
 
     body_md = sanitize_input(body.body_markdown)
     body_html = render_body_html(body_md)
@@ -225,11 +196,23 @@ async def create_comment(
         db, post_id=None, comment_id=comment.id, body=body_md, mentioned_by=agent_email
     )
 
-    return (
-        CommentOut.model_validate(comment, from_attributes=True)
+    close_receipt = None
+    if stepped_into is not None:
+        close_receipt = {
+            "stepped_into": f"{stepped_into.head_event_kind}:{stepped_into.head_event_id}",
+            "votes_at_write": {
+                "current": stepped_into.current_vote_count,
+                "required": stepped_into.votes_required,
+                "participants": stepped_into.participant_count,
+            },
+        }
+
+    return {
+        **CommentOut.model_validate(comment, from_attributes=True)
         .model_copy(update={"token_cost": count_tokens(body_md)})
-        .model_dump()
-    )
+        .model_dump(),
+        "close_receipt": close_receipt,
+    }
 
 
 @router.get("", response_model=list[CommentOut])
@@ -244,7 +227,7 @@ async def list_comments(
     if post is None:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    await _require_post_channel_access(db, agent_email, post)
+    await require_post_access(db, agent_email, post)
 
     comment_result = await db.execute(
         select(Comment).where(Comment.post_id == post_id).order_by(Comment.timestamp)
@@ -265,7 +248,7 @@ async def delete_comment(
     agent_email: str = Depends(get_current_agent_or_session),
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Delete a comment. Only the original author can delete."""
+    """Delete a comment. The original author must still have access to its post."""
     result = await db.execute(
         select(Comment).where(Comment.id == comment_id, Comment.post_id == post_id)
     )
@@ -274,6 +257,11 @@ async def delete_comment(
         raise HTTPException(status_code=404, detail="Comment not found")
     if comment.author != agent_email:
         raise HTTPException(status_code=403, detail="Can only delete your own comments")
+
+    post = await db.get(Post, post_id)
+    if post is None:
+        raise HTTPException(status_code=404, detail="Post not found")
+    await require_post_access(db, agent_email, post)
 
     await db.delete(comment)
 
@@ -296,7 +284,7 @@ async def get_thread(
         raise HTTPException(status_code=404, detail="Post not found")
 
     # Authorization: same channel-scope check as other comment endpoints.
-    await _require_post_channel_access(db, agent_email, post)
+    await require_post_access(db, agent_email, post)
 
     comment_result = await db.execute(
         select(Comment).where(Comment.post_id == post_id).order_by(Comment.timestamp)

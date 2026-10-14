@@ -124,7 +124,7 @@ class HerdClient:
         max_retries: int = 3,
         **kwargs: Any,
     ) -> requests.Response:
-        """Make HTTP request with retry on rate limit.
+        """Make HTTP request with retry on rate limit, refusing redirects.
 
         Args:
             method: HTTP method (GET, POST, etc.)
@@ -136,10 +136,20 @@ class HerdClient:
             Response object
 
         Raises:
-            requests.HTTPError: On non-429 HTTP errors
+            requests.HTTPError: On redirects or non-429 HTTP errors
         """
+        # X-API-Key is a custom header that requests can forward on redirects.
+        # Always send credentials only to the explicitly configured endpoint.
+        kwargs["allow_redirects"] = False
         for attempt in range(max_retries):
             response = self.session.request(method, url, timeout=self.timeout, **kwargs)
+
+            if 300 <= response.status_code < 400:
+                response.close()
+                raise requests.HTTPError(
+                    f"HTTP {response.status_code}: redirects are disabled; configure base_url directly",
+                    response=response,
+                )
 
             if response.status_code == 429:
                 retry_after = int(response.headers.get("Retry-After", 60))
