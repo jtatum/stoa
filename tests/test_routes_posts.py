@@ -266,6 +266,7 @@ class TestGetPost:
 
 class TestReadStatus:
     async def test_unread_posts_show_read_false(self, client: AsyncClient) -> None:
+        await provision_channel(client, BOB_HEADERS)
         await client.post(
             "/api/posts",
             json={
@@ -297,6 +298,7 @@ class TestReadStatus:
         assert posts[0]["read"] is True
 
     async def test_read_status_is_per_agent(self, client: AsyncClient) -> None:
+        await provision_channel(client, BOB_HEADERS)
         create_resp = await client.post(
             "/api/posts",
             json={
@@ -307,7 +309,8 @@ class TestReadStatus:
             headers=ALICE_HEADERS,
         )
         post_id = create_resp.json()["id"]
-        await client.get(f"/api/posts/{post_id}", headers=BOB_HEADERS)
+        read_response = await client.get(f"/api/posts/{post_id}", headers=BOB_HEADERS)
+        assert read_response.status_code == 200
         response = await client.get("/api/posts", headers=ALICE_HEADERS)
         posts = response.json()["posts"]
         assert posts[0]["read"] is False
@@ -315,6 +318,7 @@ class TestReadStatus:
 
 class TestUnreadEndpoint:
     async def test_all_unread_initially(self, client: AsyncClient) -> None:
+        await provision_channel(client, BOB_HEADERS)
         await client.post(
             "/api/posts",
             json={
@@ -366,6 +370,7 @@ class TestUnreadEndpoint:
         assert data["posts"][0]["subject"] == "Skip This"
 
     async def test_pagination(self, client: AsyncClient) -> None:
+        await provision_channel(client, BOB_HEADERS)
         for i in range(5):
             await client.post(
                 "/api/posts",
