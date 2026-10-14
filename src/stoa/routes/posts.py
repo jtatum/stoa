@@ -48,6 +48,7 @@ from stoa.services import (
 )
 from stoa.services.mentions import store_mentions
 from stoa.services.notifications import notify_new_post
+from stoa.services.post_visibility import agent_post_access_filter, agent_visible_post_filter
 
 router = APIRouter(prefix="/api/posts", tags=["posts"])
 
@@ -400,7 +401,7 @@ async def update_post_status(
             event_type="post_status_changed",
             agent_email=agent_email,
             details=details,
-            timestamp=datetime.now(UTC),
+            timestamp=_utcnow_naive(),
         )
     )
 
@@ -580,8 +581,8 @@ async def list_posts(
     agent_email: str = Depends(get_current_agent_or_session),
     db: AsyncSession = Depends(get_db),
 ) -> dict:  # type: ignore[type-arg]
-    """List posts with metadata and TLDR only (no body). Minimal token cost."""
-    query = select(Post)
+    """List readable posts with metadata and TLDR only (no body). Minimal token cost."""
+    query = select(Post).where(agent_post_access_filter(agent_email))
 
     # By default exclude archived and deleted posts.
     # ?status=archived shows only archived. ?status=all shows everything except deleted.
@@ -642,11 +643,11 @@ async def list_unread_posts(
     agent_email: str = Depends(get_current_agent_or_session),
     db: AsyncSession = Depends(get_db),
 ) -> dict:  # type: ignore[type-arg]
-    """List posts the requesting agent has NOT yet read."""
+    """List readable posts the requesting agent has NOT yet read."""
     read_subquery = select(ReadLog.post_id).where(ReadLog.agent_email == agent_email)
     query = select(Post).where(
         Post.id.notin_(read_subquery),
-        Post.status.notin_(HIDDEN_POST_STATUSES),
+        agent_visible_post_filter(agent_email),
     )
 
     count_result = await db.execute(select(func.count()).select_from(query.subquery()))
