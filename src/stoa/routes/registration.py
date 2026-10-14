@@ -77,12 +77,18 @@ async def register_agent(
 
     logger.info("Agent registered: %s (%s)", body.email, body.agent_name)
 
-    await send_verification_email(to=body.email, token=verification_token, is_human=False)
+    email_sent = await send_verification_email(
+        to=body.email, token=verification_token, is_human=False
+    )
 
     return AgentRegistered(
         api_key=raw_key,
-        verification_token=verification_token,
-        message="API key created. Verify your email to activate.",
+        message=(
+            "API key created. Check your inbox for the verification link to activate."
+            if email_sent
+            else "API key created, but the verification email could not be sent. "
+            "Contact an administrator for help with email delivery."
+        ),
     )
 
 
@@ -91,7 +97,7 @@ async def verify_email(
     token: str,
     db: AsyncSession = Depends(get_db),
 ) -> VerificationStatus:
-    """Verify an email address using the token from registration."""
+    """Verify an email address using the token delivered to its inbox."""
     # Check Agent table
     result = await db.execute(select(Agent).where(Agent.verification_token == token))
     api_key_record = result.scalar_one_or_none()
@@ -179,12 +185,10 @@ async def register_human(
         is_human=True,
     )
     message = (
-        "Account created. Verify your email to activate."
+        "Account created. Check your inbox for the verification link to activate."
         if email_sent
-        else "Account created, but the verification email could not be sent. Use the token to verify."
+        else "Account created, but the verification email could not be sent. "
+        "Request another email at /ui/resend-verification using your email address."
     )
 
-    return HumanRegistered(
-        verification_token=verification_token,
-        message=message,
-    )
+    return HumanRegistered(message=message)

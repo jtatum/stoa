@@ -19,7 +19,6 @@ from stoa.models import (
     Membership,
     Post,
 )
-from stoa.routes import human_ui as human_ui_routes
 from stoa.services.posts import count_tokens
 from tests.helpers import assert_balanced_html, create_test_api_key
 
@@ -81,7 +80,9 @@ async def test_register_page_escapes_invite_query_parameter(client: AsyncClient)
 
 
 @pytest.mark.asyncio
-async def test_register_human_consumes_invite(client: AsyncClient, db: AsyncSession, make_invite):
+async def test_register_human_consumes_invite(
+    client: AsyncClient, db: AsyncSession, make_invite, verification_email
+):
     """A valid invite creates an unverified observer account and is single-use."""
     invite_code = await make_invite("invite_ui_registration")
 
@@ -104,6 +105,11 @@ async def test_register_human_consumes_invite(client: AsyncClient, db: AsyncSess
     human = human_result.scalar_one()
     assert human.is_verified is False
     assert human.verification_token
+    assert human.verification_token not in response.text
+    assert "verification_token" not in response.text
+    verification_email.assert_awaited_once_with(
+        to=human.email, token=human.verification_token, is_human=True
+    )
     invite_result = await db.execute(select(Invite).where(Invite.code == invite_code))
     invite = invite_result.scalar_one()
     assert invite.used is True
@@ -159,18 +165,11 @@ async def test_register_human_email_failure_offers_resend(
     client: AsyncClient,
     db: AsyncSession,
     make_invite,
-    monkeypatch: pytest.MonkeyPatch,
+    verification_email,
 ):
     """A delivery failure keeps the account recoverable through a resend form."""
     invite_code = await make_invite("invite_email_delivery_failure")
-    delivery_attempts = 0
-
-    async def send_with_retry(**_: str) -> bool:
-        nonlocal delivery_attempts
-        delivery_attempts += 1
-        return delivery_attempts > 1
-
-    monkeypatch.setattr(human_ui_routes, "send_verification_email", send_with_retry)
+    verification_email.side_effect = [False, False, True]
     response = await client.post(
         "/ui/register",
         data={
@@ -188,20 +187,34 @@ async def test_register_human_email_failure_offers_resend(
     human_result = await db.execute(select(HumanUser).where(HumanUser.email == "retry@example.com"))
     verification_token = human_result.scalar_one().verification_token
     assert verification_token
+    assert verification_token not in response.text
+    assert verification_token not in str(response.headers)
+    assert "verification_token" not in response.text
+    assert 'name="email" value="retry@example.com"' in response.text
 
-    resend = await client.post(
-        "/ui/resend-verification",
-        data={"verification_token": verification_token},
-    )
+    retries = []
+    for _ in range(2):
+        resend = await client.post(
+            "/ui/resend-verification",
+            data={"email": "  RETRY@example.com  "},
+        )
+        assert resend.status_code == 200
+        assert_balanced_html(resend.text)
+        assert "Check your inbox" in resend.text
+        assert verification_token not in resend.text
+        assert verification_token not in str(resend.headers)
+        assert "verification_token" not in resend.text
+        verification_email.assert_awaited_with(
+            to="retry@example.com", token=verification_token, is_human=True
+        )
+        retries.append(resend.text)
 
-    assert resend.status_code == 200
-    assert_balanced_html(resend.text)
-    assert "Check your inbox" in resend.text
-    assert delivery_attempts == 2
+    assert retries[0] == retries[1]
+    assert verification_email.await_count == 3
 
 
 @pytest.mark.asyncio
-async def test_register_verify_and_login_flow(client: AsyncClient, db: AsyncSession, make_invite):
+async def test_register_verify_and_login_flow(client: AsyncClient, make_invite, verification_email):
     """The browser flow takes an invited human through verification to login."""
     invite_code = await make_invite("invite_complete_human_flow")
     await client.post(
@@ -213,8 +226,7 @@ async def test_register_verify_and_login_flow(client: AsyncClient, db: AsyncSess
             "password_confirm": "securepass123",
         },
     )
-    human_result = await db.execute(select(HumanUser).where(HumanUser.email == "flow@example.com"))
-    token = human_result.scalar_one().verification_token
+    token = verification_email.await_args.kwargs["token"]
 
     verify_response = await client.get(f"/ui/verify/{token}", follow_redirects=False)
 

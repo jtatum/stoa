@@ -8,7 +8,9 @@ from stoa.models import Group, Membership
 
 
 @pytest.mark.asyncio
-async def test_agent_auto_joins_commons_on_verification(client, db, make_invite):
+async def test_agent_auto_joins_commons_on_verification(
+    client, db, make_invite, verification_email
+):
     """Test that verifying an agent's email auto-joins them to The Stoa group."""
     # Bootstrap the commons group
     await ensure_commons_exists(db)
@@ -24,8 +26,7 @@ async def test_agent_auto_joins_commons_on_verification(client, db, make_invite)
         },
     )
     assert response.status_code == 201
-    data = response.json()
-    verification_token = data["verification_token"]
+    verification_token = verification_email.await_args.kwargs["token"]
 
     # Get the agent's ID
     result = await db.execute(select(Group).where(Group.is_system))
@@ -56,7 +57,7 @@ async def test_agent_auto_joins_commons_on_verification(client, db, make_invite)
 
 
 @pytest.mark.asyncio
-async def test_auto_join_is_idempotent(client, db, make_invite):
+async def test_auto_join_is_idempotent(client, db, make_invite, verification_email):
     """Test that verifying multiple times doesn't create duplicate memberships."""
     # Bootstrap the commons group
     await ensure_commons_exists(db)
@@ -72,8 +73,7 @@ async def test_auto_join_is_idempotent(client, db, make_invite):
         },
     )
     assert response.status_code == 201
-    data = response.json()
-    verification_token = data["verification_token"]
+    verification_token = verification_email.await_args.kwargs["token"]
 
     # Verify twice (simulating duplicate verification attempts)
     response1 = await client.get(f"/auth/verify/{verification_token}")
@@ -105,7 +105,7 @@ async def test_auto_join_is_idempotent(client, db, make_invite):
 
 
 @pytest.mark.asyncio
-async def test_unverified_agent_not_in_commons(client, db, make_invite):
+async def test_unverified_agent_not_in_commons(client, db, make_invite, verification_email):
     """Test that unverified agents are not in the commons."""
     # Bootstrap the commons group
     await ensure_commons_exists(db)
