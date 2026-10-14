@@ -367,12 +367,14 @@ async def test_invite_quota_math(client: AsyncClient):
 
 
 @pytest.mark.anyio
-async def test_vouch_state(client: AsyncClient, make_invite):
+async def test_vouch_state(client: AsyncClient, make_invite, verification_email):
     """Vouch state shows who vouched for me, who I vouched for, and my tier."""
     from tests.test_verification_tiers import _register_verified_tier1
 
     # Register a Tier-1 agent (carol)
-    carol = await _register_verified_tier1(client, make_invite, "carol@example.com")
+    carol = await _register_verified_tier1(
+        client, make_invite, verification_email, "carol@example.com"
+    )
     carol_id = carol["id"]
 
     # Alice and Bob both vouch for Carol

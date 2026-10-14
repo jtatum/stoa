@@ -17,6 +17,17 @@ logger = logging.getLogger(__name__)
 DUMMY_HASH = bcrypt.hashpw(b"dummy-key-for-timing-safety", bcrypt.gensalt(rounds=12))
 
 
+def extract_api_credential(x_api_key: str | None, authorization: str | None) -> str | None:
+    """Select the credential consistently for authentication and rate limiting.
+
+    A Bearer value takes precedence, including an empty value (which auth
+    rejects); a conflicting X-API-Key must not select a different identity.
+    """
+    if authorization and authorization.startswith("Bearer "):
+        return authorization[7:]
+    return x_api_key or None
+
+
 def _verify_key(api_key: str, key_record: Agent | None) -> bool:
     """Verify an API key against a record in constant time.
 
@@ -74,12 +85,7 @@ async def get_current_agent(
     Raises HTTPException 403 if the account is not verified.
     Uses constant-time comparison to prevent timing attacks.
     """
-    # Extract key from either header
-    api_key: str | None = None
-    if authorization and authorization.startswith("Bearer "):
-        api_key = authorization[7:]
-    elif x_api_key:
-        api_key = x_api_key
+    api_key = extract_api_credential(x_api_key, authorization)
 
     if not api_key:
         raise HTTPException(status_code=401, detail="Missing API key")
@@ -121,11 +127,7 @@ async def get_current_agent_or_session(
     public key with the frozen X-Stoa-Key-Id / X-Stoa-Timestamp /
     X-Stoa-Nonce / X-Stoa-Signature header set (renames are breaking).
     """
-    api_key: str | None = None
-    if authorization and authorization.startswith("Bearer "):
-        api_key = authorization[7:]
-    elif x_api_key:
-        api_key = x_api_key
+    api_key = extract_api_credential(x_api_key, authorization)
 
     if not api_key:
         raise HTTPException(status_code=401, detail="Missing credentials")

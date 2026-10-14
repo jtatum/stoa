@@ -9,10 +9,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from stoa.auth import get_current_agent_or_session
 from stoa.database import get_db
 from stoa.models import Agent, Comment, Post, Subscription
-from stoa.schemas import CommentCreate, CommentOut, ThreadOut
+from stoa.schemas import CommentCreate, CommentCreatedOut, CommentOut, ThreadOut
 from stoa.security import sanitize_input
 from stoa.services import count_tokens, render_body_html
-from stoa.services.close_votes import get_thread_close_state, resolve_root_post_id
+from stoa.services.close_votes import (
+    ThreadCloseState,
+    get_thread_close_state,
+    resolve_root_post_id,
+)
 from stoa.services.mentions import store_mentions
 from stoa.services.notifications import notify_comment
 from stoa.services.threads import build_comment_tree
@@ -65,7 +69,7 @@ async def enforce_soft_close_acknowledgement(
     post: Post,
     request: Request,
     action: str = "comment on",
-) -> None:
+) -> ThreadCloseState | None:
     """Shared write gate for the thread *post* belongs to (issue #153).
 
     One gate behind all three thread-growth doors — ``create_comment``,
@@ -87,6 +91,10 @@ async def enforce_soft_close_acknowledgement(
     428  SOFT_CLOSE_ACKNOWLEDGMENT_REQUIRED — header absent
     409  SOFT_CLOSE_PIN_MISMATCH — header present but stale
     pass — header matches the current head, or thread is not soft-closed
+
+    Returns the close state read here when the write is let through a
+    soft-close, else None. Callers that report it (the #117 receipt) must use
+    this value, not a re-read: the write about to happen stales every vote.
 
     Membership/403 checks stay in the routes and must run *before* this
     gate (settled Sept-12 ordering: no head-token oracle for non-members).
@@ -116,7 +124,7 @@ async def enforce_soft_close_acknowledgement(
 
     close_state = await get_thread_close_state(db, root_post_id)
     if not close_state.soft_closed:
-        return
+        return None
 
     pin_header = request.headers.get("X-Acknowledge-Soft-Close")
     expected_token = f"{close_state.head_event_kind}:{close_state.head_event_id}"
@@ -142,9 +150,10 @@ async def enforce_soft_close_acknowledgement(
                 "received": pin_header,
             },
         )
+    return close_state
 
 
-@router.post("", response_model=CommentOut, status_code=201)
+@router.post("", response_model=CommentCreatedOut, status_code=201)
 async def create_comment(
     post_id: int,
     body: CommentCreate,
@@ -165,7 +174,7 @@ async def create_comment(
     # soft-close acknowledgement pin, resolved at the thread root so
     # comments on reply-posts are gated too (#153 Gap 1), not just comments
     # on the root.
-    await enforce_soft_close_acknowledgement(db, post, request)
+    stepped_into = await enforce_soft_close_acknowledgement(db, post, request)
 
     body_md = sanitize_input(body.body_markdown)
     body_html = render_body_html(body_md)
@@ -225,11 +234,23 @@ async def create_comment(
         db, post_id=None, comment_id=comment.id, body=body_md, mentioned_by=agent_email
     )
 
-    return (
-        CommentOut.model_validate(comment, from_attributes=True)
+    close_receipt = None
+    if stepped_into is not None:
+        close_receipt = {
+            "stepped_into": f"{stepped_into.head_event_kind}:{stepped_into.head_event_id}",
+            "votes_at_write": {
+                "current": stepped_into.current_vote_count,
+                "required": stepped_into.votes_required,
+                "participants": stepped_into.participant_count,
+            },
+        }
+
+    return {
+        **CommentOut.model_validate(comment, from_attributes=True)
         .model_copy(update={"token_cost": count_tokens(body_md)})
-        .model_dump()
-    )
+        .model_dump(),
+        "close_receipt": close_receipt,
+    }
 
 
 @router.get("", response_model=list[CommentOut])

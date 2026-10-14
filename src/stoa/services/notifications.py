@@ -14,6 +14,7 @@ the originating request (post/comment creation) is never blocked.
 """
 
 import logging
+from html import escape
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,7 +24,9 @@ from stoa.email import send_email
 from stoa.models import (
     Agent,
     AuditLog,
+    Channel,
     Comment,
+    Membership,
     Post,
     Subscription,
 )
@@ -59,14 +62,15 @@ def _comment_email_body(
     url = _build_post_url(post.id)
     unsub_url = _build_unsubscribe_post_url(post.id)
 
+    # Escape at the HTML boundary so previews and plain-text mail stay literal.
     html = (
-        f"<p>New comment by <strong>{author_email}</strong> on "
-        f'<a href="{url}">"{post.subject}"</a>:</p>'
-        f"<blockquote>{preview}</blockquote>"
-        f'<p><a href="{url}">View the full thread</a></p>'
+        f"<p>New comment by <strong>{escape(author_email)}</strong> on "
+        f'<a href="{escape(url)}">"{escape(post.subject)}"</a>:</p>'
+        f"<blockquote>{escape(preview)}</blockquote>"
+        f'<p><a href="{escape(url)}">View the full thread</a></p>'
         f'<hr><p style="font-size:small;color:#888">'
-        f"You're receiving this because you {reason}. "
-        f'To unsubscribe, visit <a href="{unsub_url}">{unsub_url}</a> (DELETE).'
+        f"You're receiving this because you {escape(reason)}. "
+        f'To unsubscribe, visit <a href="{escape(unsub_url)}">{escape(unsub_url)}</a> (DELETE).'
         f"</p>"
     )
     text = (
@@ -89,13 +93,14 @@ def _new_post_email_body(
     preview = (post.tldr or post.body_markdown or "")[:200]
     url = _build_post_url(post.id)
 
+    # Escape at the HTML boundary so previews and plain-text mail stay literal.
     html = (
-        f"<p>New post by <strong>{author_email}</strong> in a channel you subscribe to:</p>"
-        f'<p><a href="{url}">"{post.subject}"</a></p>'
-        f"<blockquote>{preview}</blockquote>"
-        f'<p><a href="{url}">View the full post</a></p>'
+        f"<p>New post by <strong>{escape(author_email)}</strong> in a channel you subscribe to:</p>"
+        f'<p><a href="{escape(url)}">"{escape(post.subject)}"</a></p>'
+        f"<blockquote>{escape(preview)}</blockquote>"
+        f'<p><a href="{escape(url)}">View the full post</a></p>'
         f'<hr><p style="font-size:small;color:#888">'
-        f"You're receiving this because you {reason}."
+        f"You're receiving this because you {escape(reason)}."
         f"</p>"
     )
     text = (
@@ -107,6 +112,28 @@ def _new_post_email_body(
         f"You're receiving this because you {reason}.\n"
     )
     return html, text
+
+
+async def _get_candidate_agents_with_access(
+    db: AsyncSession,
+    post: Post,
+    emails: list[str],
+) -> dict[str, Agent]:
+    """Resolve candidates using current access, not historical participation.
+
+    All channel-scoped posts require membership in the channel's group,
+    regardless of group visibility. The joins also exclude missing channels.
+    Legacy unscoped posts remain public.
+    """
+    query = select(Agent).where(Agent.agent_email.in_(emails))
+    if post.channel_id is not None:
+        query = (
+            query.join(Membership, Membership.agent_id == Agent.id)
+            .join(Channel, Channel.group_id == Membership.group_id)
+            .where(Channel.id == post.channel_id)
+        )
+    result = await db.execute(query)
+    return {agent.agent_email: agent for agent in result.scalars().all()}
 
 
 async def get_comment_recipients(
@@ -130,6 +157,8 @@ async def get_comment_recipients(
        - ``"replies_only"`` — included only if they participated or are the post author
        - ``"all"`` — included for any activity in their subscribed channels/posts
     6. Exclude the comment author.
+    7. Require current group membership for every channel-scoped recipient,
+       including the post author and previous participants.
     """
     # Collect candidate agent emails and their roles
     candidates: dict[str, str] = {}  # email -> reason
@@ -183,13 +212,12 @@ async def get_comment_recipients(
                 candidates[agent.agent_email] = "subscribed to this channel"
 
     # 5. Filter by notification_scope
-    # We need agent records for all candidates to check their scope
+    # Recheck access for all candidates, including stale subscriptions/authors.
     all_emails = list(candidates.keys())
     if not all_emails:
         return []
 
-    agents_result = await db.execute(select(Agent).where(Agent.agent_email.in_(all_emails)))
-    agents_by_email: dict[str, Agent] = {a.agent_email: a for a in agents_result.scalars().all()}
+    agents_by_email = await _get_candidate_agents_with_access(db, post, all_emails)
 
     recipients: list[tuple[str, int, str]] = []
     for email, reason in candidates.items():
@@ -234,6 +262,8 @@ async def get_new_post_recipients(
          author (candidate 1); channel subscribers are excluded
        - ``"all"`` — included
     4. Exclude the post author.
+    5. Require current group membership for every channel-scoped recipient,
+       including the parent post author.
     """
     candidates: dict[str, str] = {}  # email -> reason
 
@@ -264,8 +294,7 @@ async def get_new_post_recipients(
 
     # 3. Filter by notification_scope
     all_emails = list(candidates.keys())
-    agents_result = await db.execute(select(Agent).where(Agent.agent_email.in_(all_emails)))
-    agents_by_email: dict[str, Agent] = {a.agent_email: a for a in agents_result.scalars().all()}
+    agents_by_email = await _get_candidate_agents_with_access(db, post, all_emails)
 
     recipients: list[tuple[str, int, str]] = []
     for email, reason in candidates.items():

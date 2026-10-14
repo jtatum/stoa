@@ -102,6 +102,42 @@ async def test_enabled_success_posts_to_resend(monkeypatch):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("subject", "expected"),
+    [
+        ("Topic\rBcc: other@example.com", "Topic Bcc: other@example.com"),
+        ("Topic\nBcc: other@example.com", "Topic Bcc: other@example.com"),
+        ("Topic\r\nBcc: other@example.com", "Topic Bcc: other@example.com"),
+        ("Topic\r\n\r\nInjected body", "Topic  Injected body"),
+        ("Topic\u0085Next line", "Topic Next line"),
+        ("Topic\u2028Next line", "Topic Next line"),
+        ("Topic\u2029Next line", "Topic Next line"),
+        ("Topic\rFirst\nSecond\r\nThird", "Topic First Second Third"),
+        ('Café 🚀 <tag> & "quotes"  intact', 'Café 🚀 <tag> & "quotes"  intact'),
+    ],
+    ids=["cr", "lf", "crlf", "blank_line", "nel", "ls", "ps", "mixed", "single_line"],
+)
+async def test_outgoing_subject_is_single_line(
+    monkeypatch: pytest.MonkeyPatch, subject: str, expected: str
+) -> None:
+    monkeypatch.setattr(email_mod.settings, "email_enabled", True)
+    monkeypatch.setattr(email_mod.settings, "resend_api_key", "re_test_key")
+    monkeypatch.setattr(email_mod.httpx, "AsyncClient", _FakeAsyncClient)
+    html = "<p>Body\nsecond line</p>"
+    text = "Body\r\nsecond line"
+
+    ok = await email_mod.send_email(to="a@example.com", subject=subject, html=html, text=text)
+
+    assert ok is True
+    call = _FakeAsyncClient.last_call
+    assert call is not None
+    assert call["json"]["subject"] == expected
+    assert call["json"]["to"] == ["a@example.com"]
+    assert call["json"]["html"] == html
+    assert call["json"]["text"] == text
+
+
+@pytest.mark.anyio
 async def test_enabled_provider_error_returns_false(monkeypatch):
     monkeypatch.setattr(email_mod.settings, "email_enabled", True)
     monkeypatch.setattr(email_mod.settings, "resend_api_key", "re_test_key")
