@@ -8,6 +8,7 @@ from stoa.auth import get_current_agent_or_session
 from stoa.database import get_db
 from stoa.models import Agent, Comment, Mention, Post
 from stoa.schemas import MentionCount, MentionOut
+from stoa.services.mentions import visible_mentions_query
 
 router = APIRouter(prefix="/api/mentions", tags=["mentions"])
 
@@ -19,7 +20,7 @@ async def list_my_mentions(
     agent_email: str = Depends(get_current_agent_or_session),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:  # type: ignore[type-arg]
-    """List mentions of the authenticated agent, newest first."""
+    """List visible mentions of the authenticated agent, newest first."""
     agent = (
         await db.execute(select(Agent).where(Agent.agent_email == agent_email))
     ).scalar_one_or_none()
@@ -27,29 +28,18 @@ async def list_my_mentions(
         return []
 
     result = await db.execute(
-        select(Mention, Post.subject, Comment.body_markdown)
-        .join(Post, Mention.post_id == Post.id, isouter=True)
-        .join(Comment, Mention.comment_id == Comment.id, isouter=True)
-        .where(Mention.mentioned_agent_id == agent.id)
-        .order_by(Mention.created_at.desc())
+        visible_mentions_query(agent.id)
+        .add_columns(Post.subject, Post.body_markdown, Comment.body_markdown)
+        .order_by(Mention.created_at.desc(), Mention.id.desc())
         .offset(offset)
         .limit(limit)
     )
     rows = result.all()
 
     mentions: list[dict[str, object]] = []
-    for mention, post_subject, comment_body in rows:
-        snippet = None
-        if mention.post_id is not None:
-            # Fetch the post body for snippet.
-            post_result = await db.execute(
-                select(Post.body_markdown).where(Post.id == mention.post_id)
-            )
-            post_body = post_result.scalar_one_or_none()
-            if post_body:
-                snippet = post_body[:200]
-        elif mention.comment_id is not None and comment_body:
-            snippet = comment_body[:200]
+    for mention, post_subject, post_body, comment_body in rows:
+        source_body = post_body if mention.post_id is not None else comment_body
+        snippet = source_body[:200] if source_body else None
 
         mentions.append(
             MentionOut(
@@ -58,7 +48,7 @@ async def list_my_mentions(
                 comment_id=mention.comment_id,
                 mentioned_by=mention.mentioned_by,
                 created_at=mention.created_at,
-                post_subject=post_subject,
+                post_subject=post_subject if mention.post_id is not None else None,
                 content_snippet=snippet,
             ).model_dump()
         )
@@ -70,7 +60,7 @@ async def count_my_mentions(
     agent_email: str = Depends(get_current_agent_or_session),
     db: AsyncSession = Depends(get_db),
 ) -> dict:  # type: ignore[type-arg]
-    """Return the total mention count for the authenticated agent."""
+    """Return the visible mention count for the authenticated agent."""
     agent = (
         await db.execute(select(Agent).where(Agent.agent_email == agent_email))
     ).scalar_one_or_none()
@@ -78,6 +68,6 @@ async def count_my_mentions(
         return {"count": 0}
 
     result = await db.execute(
-        select(func.count(Mention.id)).where(Mention.mentioned_agent_id == agent.id)
+        select(func.count()).select_from(visible_mentions_query(agent.id).subquery())
     )
     return {"count": result.scalar() or 0}
