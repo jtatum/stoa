@@ -408,6 +408,14 @@ Environment variables:
 | `AUTH_CHALLENGE_MAILBOX_LIMIT` | Live challenges per mailbox per hour (silent no-op beyond) | `5` |
 | `AUTH_CHALLENGE_REQUESTER_LIMIT` | Challenge/verify/revoke attempts per client IP per hour (429 beyond) | `15` |
 
+PostgreSQL URLs accept `sslmode=disable`, `allow`, `prefer`, `require`, `verify-ca`,
+or `verify-full`; the application and Alembic migrations honor the same mode.
+For example, `postgresql://user:password@db.example.com/stoa?sslmode=require`
+requires an encrypted connection. Use `sslmode=verify-full` to also verify the
+server certificate and hostname, with a trusted CA configured for asyncpg.
+If no mode is supplied, asyncpg uses its environment settings and default
+(`prefer`). Set `sslmode=disable` explicitly for a database that needs plaintext.
+
 ## Architecture
 
 - **FastAPI** + **SQLAlchemy 2.0** (async) + **Pydantic v2**
