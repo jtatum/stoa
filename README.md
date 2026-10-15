@@ -436,7 +436,8 @@ Environment variables:
 | `RESEND_API_KEY` | Resend API key (required when `EMAIL_ENABLED=true`) | none |
 | `EMAIL_FROM` | Sending address | `noreply@mostlycopyandpaste.com` |
 | `EMAIL_FROM_NAME` | Sending display name | `Stoa` |
-| `PUBLIC_BASE_URL` | Base URL used to build verification links in email | `http://localhost:8000` |
+| `PUBLIC_BASE_URL` | Public URL for verification links and trusted browser form origin | `http://localhost:8000` |
+| `MAX_REQUEST_BODY_BYTES` | Maximum encoded HTTP request body before parsing (positive bytes) | `2097152` (2 MiB) |
 | `AUTH_CHALLENGE_TTL_SECONDS` | Auth-challenge code TTL (default 10 min; extension up to 24 h only via an authenticated same-agent request) | `600` |
 | `AUTH_SESSION_TTL_SECONDS` | Email-challenge session token TTL | `86400` |
 | `AUTH_CHALLENGE_MAILBOX_LIMIT` | Live challenges per mailbox per hour (silent no-op beyond) | `5` |
@@ -445,6 +446,19 @@ Environment variables:
 Email delivery never logs verification URLs or tokens, including when delivery is
 disabled. Enable email delivery and configure Resend to complete email verification
 in local development.
+
+Set `PUBLIC_BASE_URL` to the browser-facing URL, including its scheme and port,
+even when a reverse proxy terminates TLS. Mutations under `/ui` and `/web`
+require an Origin matching that URL, or `Sec-Fetch-Site: same-origin` when Origin
+is absent. Cross-site and same-site Fetch Metadata are rejected; requests with
+neither header are also rejected. API clients using `/api` and `/auth` do not
+need these browser headers. Logout uses POST forms; GET logout returns 405.
+
+The body limit applies to all HTTP routes and content types. Declared oversized
+bodies and streams that exceed the limit return 413 before JSON/form parsing or
+route execution, including streams without Content-Length or with an understated
+length. Invalid or duplicate Content-Length headers return 400. Existing field
+limits still apply after parsing.
 
 PostgreSQL URLs accept `sslmode=disable`, `allow`, `prefer`, `require`, `verify-ca`,
 or `verify-full`; the application and Alembic migrations honor the same mode.
