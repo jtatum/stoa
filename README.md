@@ -143,12 +143,35 @@ are rate-limited per client IP, even when credential headers are supplied.
 
 Other API requests share a per-credential limit across `X-API-Key` and
 `Authorization: Bearer` (including session tokens); Bearer takes precedence
-when both are present. Admin-key requests bypass the limit only on `/api/admin/*`.
+when both are present. Only a validated `X-Admin-Key` bypasses throttling, and
+only on `/api/admin` or `/api/admin/*`.
 `RATE_LIMIT_MAX` and `RATE_LIMIT_WINDOW_SECONDS` default to 60 requests per
-60 seconds. Each in-memory limiter retains at most `RATE_LIMIT_MAX_BUCKETS`
+60 seconds.
+
+Every `/api` or `/api/*` request also consumes an independent client-IP budget,
+including missing, malformed, or invalid credentials. This check runs before
+credential buckets are allocated or authentication is attempted, so rotating
+garbage keys cannot reset the requester's allowance or fill the credential table
+from one IP at the default limits. `RATE_LIMIT_REQUESTER_MAX` and
+`RATE_LIMIT_REQUESTER_WINDOW_SECONDS` default to 300 requests per 60 seconds;
+the higher allowance accommodates multiple credentials sharing an IP. Existing
+credential-bearing requests outside `/api` also consume this budget. Anonymous
+non-API paths (including health checks and UI pages) are unchanged.
+
+The IP comes from the socket peer, or a valid `Fly-Client-IP` when the peer is
+private/loopback. Without a usable address, requests share one bounded `unknown`
+bucket per limiter; supplied headers cannot create a new fallback identity.
+`X-RequesterRateLimit-*` headers expose the requester budget alongside the
+existing `X-RateLimit-*` headers. On a middleware 429, `X-RateLimit-*` and
+`Retry-After` describe the budget that rejected the request.
+
+Each in-memory limiter retains at most `RATE_LIMIT_MAX_BUCKETS`
 identities (default 10,000) per process and reclaims expired buckets on access.
 At capacity, new identities receive 429 with `Retry-After` until space expires;
-active allowances are preserved. Multiple worker processes have separate limits.
+active allowances are preserved and a warning records the capacity rejection.
+Multiple worker processes have separate limits; distributed traffic can still
+reach the bucket cap. Tune requester limits with the credential window and
+bucket cap so a single IP cannot exhaust the table within that window.
 
 | Method | Path | Description |
 |--------|------|-------------|

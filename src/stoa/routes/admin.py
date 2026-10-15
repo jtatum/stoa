@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from stoa.auth import is_valid_admin_key
 from stoa.credentials import hash_credential
 from stoa.database import get_db
 from stoa.models import TIER_VERIFIED, Agent, AuditLog, Invite, Post, ReadLog
@@ -32,13 +33,7 @@ def require_admin(
     x_admin_key: str = Header(..., alias="X-Admin-Key"),
 ) -> None:
     """Validate admin key from header."""
-    expected = os.environ.get(ADMIN_KEY_ENV, "")
-    # Encode to bytes so secrets.compare_digest works for any Unicode input.
-    # Non-ASCII headers (e.g. en-dash pasted for hyphen) would otherwise raise
-    # TypeError and surface as a 500 instead of the intended 401 (issue #88).
-    if not expected or not secrets.compare_digest(
-        x_admin_key.encode("utf-8"), expected.encode("utf-8")
-    ):
+    if not is_valid_admin_key(x_admin_key):
         logger.warning("Admin auth failure")
         raise HTTPException(status_code=401, detail="Invalid admin key")
 

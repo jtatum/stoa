@@ -359,7 +359,7 @@ async def test_malformed_fly_client_ip_reads_as_no_header(
 
 @pytest.mark.asyncio
 async def test_unauthenticated_non_public_paths_still_pass_through(client: AsyncClient):
-    """Only /api/public/* is IP-limited; other anonymous paths behave as before."""
+    """Anonymous UI pages remain outside the API requester budget."""
     for _ in range(70):
         response = await client.get("/ui/login")
         assert response.status_code == 200
@@ -406,9 +406,7 @@ async def test_none_peer_on_public_path_logs_warning(
     """Issue #85: peerless request on a public path must log a warning.
 
     When request.client is None (certain ASGI transports), _extract_client_ip
-    returns None and the request passes unthrottled. That is acceptable
-    fail-open behaviour, but the gap must be visible in prod telemetry —
-    a silent pass-through is operationally invisible.
+    returns None. The shared fallback budget must be visible in telemetry.
     """
     import logging
 
@@ -438,7 +436,8 @@ async def test_none_peer_on_public_path_logs_warning(
         with caplog.at_level(logging.WARNING, logger="stoa.rate_limit"):
             async with AsyncClient(transport=transport, base_url="http://test") as peerless:
                 response = await peerless.get("/api/public/pinned")
-        assert response.status_code == 200  # fail-open: request passes
+        assert response.status_code == 200  # Shared fallback still has capacity.
+        assert "X-RequesterRateLimit-Limit" in response.headers
         assert (
             "unknown" in caplog.text.lower()
             or "no client" in caplog.text.lower()

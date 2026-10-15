@@ -1,6 +1,8 @@
 """API key authentication dependency (async)."""
 
 import logging
+import os
+import secrets
 from collections.abc import Awaitable, Callable
 
 from fastapi import Depends, Header, HTTPException
@@ -18,6 +20,17 @@ logger = logging.getLogger(__name__)
 # Only used when no account matches, and _verify_key always returns False then.
 # nosemgrep: generic.secrets.security.detected-bcrypt-hash.detected-bcrypt-hash
 DUMMY_HASH = b"$2b$12$lD2SLGQ.HFv9fOJt7wgki.FTpvvruxA1giUjHjnHLrs6gGDbHyPd."
+
+
+def is_valid_admin_key(value: str | None) -> bool:
+    """Use the same constant-time check for admin auth and throttle exemptions."""
+    expected = os.environ.get("ADMIN_KEY", "")
+    # Bytes also handle non-ASCII headers without compare_digest raising.
+    return bool(
+        value
+        and expected
+        and secrets.compare_digest(value.encode("utf-8"), expected.encode("utf-8"))
+    )
 
 
 def extract_api_credential(x_api_key: str | None, authorization: str | None) -> str | None:

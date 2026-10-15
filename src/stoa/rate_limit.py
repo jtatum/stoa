@@ -1,9 +1,10 @@
-"""In-memory sliding window rate limiter per API key.
+"""Independent, bounded sliding-window budgets per requester and credential.
 
 Limits and storage are configurable via ``RATE_LIMIT_MAX``,
-``RATE_LIMIT_WINDOW_SECONDS``, and ``RATE_LIMIT_MAX_BUCKETS``.
+``RATE_LIMIT_WINDOW_SECONDS``, ``RATE_LIMIT_REQUESTER_MAX``,
+``RATE_LIMIT_REQUESTER_WINDOW_SECONDS``, and ``RATE_LIMIT_MAX_BUCKETS``.
 
-Admin-key requests bypass the limiter on ``/api/admin/*`` only, so that
+Validated admin-key requests bypass the limiter on ``/api/admin/*`` only, so that
 operational sequences stay unthrottled without granting unlimited rate on
 every other endpoint. Elsewhere, admin-key requests follow the normal
 credential or public-IP limit. Admin-key identities are audited regardless
@@ -11,7 +12,9 @@ of whether they bypass the limiter.
 
 The public read surface (``/api/public/*``) is always keyed on client IP:
 those routes do not authenticate credentials, so arbitrary headers must
-not replace the IP identity. Other requests without credentials pass through.
+not replace the IP identity. All API requests consume an independent IP budget
+before credential buckets are allocated or authentication runs. Requests with
+no usable client IP share one bounded fallback identity in each limiter.
 """
 
 import hashlib
@@ -25,7 +28,7 @@ from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import JSONResponse
 
-from stoa.auth import extract_api_credential
+from stoa.auth import extract_api_credential, is_valid_admin_key
 from stoa.config import settings
 from stoa.security import audit_log
 
@@ -64,7 +67,13 @@ class RateLimiter:
         now = time.monotonic()
         window = self._clean(key, now)
         if window is None:
-            if len(self._requests) >= self.max_buckets or self.max_requests <= 0:
+            if len(self._requests) >= self.max_buckets:
+                logger.warning(
+                    "Rate limiter bucket capacity reached (%d identities); rejecting new identity",
+                    self.max_buckets,
+                )
+                return False
+            if self.max_requests <= 0:
                 return False
             window = deque()
             self._requests[key] = window
@@ -99,11 +108,17 @@ _limiter = RateLimiter(
     window_seconds=settings.rate_limit_window_seconds,
     max_buckets=settings.rate_limit_max_buckets,
 )
+_requester_limiter = RateLimiter(
+    max_requests=settings.rate_limit_requester_max,
+    window_seconds=settings.rate_limit_requester_window_seconds,
+    max_buckets=settings.rate_limit_max_buckets,
+)
 
 
 def reset_limiter() -> None:
     """Clear all rate limit state. For testing only."""
     _limiter._requests.clear()
+    _requester_limiter._requests.clear()
 
 
 ADMIN_KEY_PREFIX = "admin:"
@@ -210,7 +225,7 @@ def _parse_client_ip(value: str) -> str | None:
 
 
 def _extract_client_ip(request: Request) -> str | None:
-    """Client IP for unauthenticated rate limiting — topology-aware.
+    """Client IP for requester rate limiting — topology-aware.
 
     Two candidate sources with different trust properties:
 
@@ -246,29 +261,79 @@ def _extract_client_ip(request: Request) -> str | None:
             parsed = _parse_client_ip(fly_ip)
             if parsed is not None:
                 return parsed
-    return peer
+    return _parse_client_ip(peer) if peer is not None else None
+
+
+def _rate_limit_response(request: Request, key: str, limiter: RateLimiter) -> Response:
+    retry_after = limiter.retry_after(key)
+    route = request.url.path
+    method = request.method
+    if key.startswith("ip:"):
+        key_prefix = f"ip:{hashlib.sha256(key[3:].encode('utf-8')).hexdigest()[:12]}"
+    else:
+        key_prefix = _identity_label(key)
+
+    # Log with actionable context: who (prefix), what (method+path),
+    # when (retry_after), how many allowed.
+    audit_log(
+        "rate_limit_hit",
+        agent_email=None,
+        details={
+            "key_prefix": key_prefix,
+            "method": method,
+            "path": route,
+            "limit": limiter.max_requests,
+            "window_s": limiter.window_seconds,
+            "retry_after_s": retry_after,
+        },
+    )
+    logger.warning(
+        "Rate limit hit: key_prefix=%s %s %s — %d/%ds, retry in %ds",
+        key_prefix,
+        method,
+        route,
+        limiter.max_requests,
+        limiter.window_seconds,
+        retry_after,
+    )
+
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": (
+                f"Rate limit exceeded: {method} {route}. "
+                f"Limit is {limiter.max_requests} requests "
+                f"per {limiter.window_seconds}s. "
+                f"Try again in {retry_after}s."
+            ),
+            "limit": limiter.max_requests,
+            "window_seconds": limiter.window_seconds,
+            "retry_after_seconds": retry_after,
+        },
+        headers={
+            "Retry-After": str(retry_after),
+            "X-RateLimit-Limit": str(limiter.max_requests),
+            "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": str(retry_after),
+        },
+    )
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         key = _extract_api_key(request)
 
-        # Admin-key requests bypass rate limiting on /api/admin/* so operators
-        # can run rapid operational sequences (key resets, stats, audit scans)
-        # without being throttled. Elsewhere they take the normal limit: an
-        # admin key should not confer unlimited throughput on public reads.
-        #
-        # Every admin-key request is audited either way. Previously an entry
-        # was written only when a request was throttled, which by definition
-        # never happened for admin keys — leaving admin-key use unlogged, and
-        # a leaked key invisible.
-        if key is not None and key.startswith(ADMIN_KEY_PREFIX):
-            bypassed = _is_admin_path(request.url.path)
+        # Use the route's actual credential check before granting the operational
+        # exemption. A supplied admin header alone is never proof of authority.
+        admin_key = request.headers.get("x-admin-key")
+        if admin_key:
+            bypassed = _is_admin_path(request.url.path) and is_valid_admin_key(admin_key)
+            admin_identity = f"admin:{hashlib.sha256(admin_key.encode('utf-8')).hexdigest()}"
             audit_log(
                 "admin_key_request",
                 agent_email=None,
                 details={
-                    "key_prefix": _identity_label(key),
+                    "key_prefix": _identity_label(admin_identity),
                     "method": request.method,
                     "path": request.url.path,
                     "rate_limit_bypassed": bypassed,
@@ -277,77 +342,44 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             if bypassed:
                 return await call_next(request)
 
-        if _is_public_read_path(request.url.path):
-            # Public routes never authenticate headers. Even a valid key
-            # must not replace the IP bucket on this anonymous surface.
-            client_ip = _extract_client_ip(request)
-            key = f"ip:{client_ip}" if client_ip is not None else None
-            if key is None:
-                logger.warning(
-                    "rate_limit: unidentifiable client on public path %s "
-                    "(no peer, no valid Fly-Client-IP) — passing unthrottled",
-                    request.url.path,
-                )
-        if key is None:
+        # Include anonymous API requests (even missing/malformed credentials),
+        # and retain the existing coverage of credential-bearing non-API paths.
+        path = request.url.path
+        if key is None and path != "/api" and not path.startswith("/api/"):
             return await call_next(request)
 
-        if not _limiter.is_allowed(key):
-            retry_after = _limiter.retry_after(key)
-            route = request.url.path
-            method = request.method
-            if key.startswith("ip:"):
-                key_prefix = f"ip:{hashlib.sha256(key[3:].encode('utf-8')).hexdigest()[:12]}"
-            else:
-                key_prefix = _identity_label(key)
-
-            # Log with actionable context: who (prefix), what (method+path),
-            # when (retry_after), how many allowed.
-            audit_log(
-                "rate_limit_hit",
-                agent_email=None,
-                details={
-                    "key_prefix": key_prefix,
-                    "method": method,
-                    "path": route,
-                    "limit": _limiter.max_requests,
-                    "window_s": _limiter.window_seconds,
-                    "retry_after_s": retry_after,
-                },
-            )
+        client_ip = _extract_client_ip(request)
+        requester_key = f"ip:{client_ip}" if client_ip is not None else "ip:unknown"
+        if client_ip is None:
             logger.warning(
-                "Rate limit hit: key_prefix=%s %s %s — %d/%ds, retry in %ds",
-                key_prefix,
-                method,
-                route,
-                _limiter.max_requests,
-                _limiter.window_seconds,
-                retry_after,
+                "rate_limit: unidentifiable client on path %s — using shared bounded budget",
+                path,
             )
 
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "detail": (
-                        f"Rate limit exceeded: {method} {route}. "
-                        f"Limit is {_limiter.max_requests} requests "
-                        f"per {_limiter.window_seconds}s. "
-                        f"Try again in {retry_after}s."
-                    ),
-                    "limit": _limiter.max_requests,
-                    "window_seconds": _limiter.window_seconds,
-                    "retry_after_seconds": retry_after,
-                },
-                headers={
-                    "Retry-After": str(retry_after),
-                    "X-RateLimit-Limit": str(_limiter.max_requests),
-                    "X-RateLimit-Remaining": "0",
-                    "X-RateLimit-Reset": str(retry_after),
-                },
-            )
+        # This must precede credential allocation: rotating garbage credentials
+        # must not fill the credential table or buy more authentication work.
+        if not _requester_limiter.is_allowed(requester_key):
+            response = _rate_limit_response(request, requester_key, _requester_limiter)
+        else:
+            if _is_public_read_path(path):
+                # Public routes never authenticate supplied credential headers.
+                key = requester_key
+            if key is not None and not _limiter.is_allowed(key):
+                response = _rate_limit_response(request, key, _limiter)
+            else:
+                response = await call_next(request)
+                limiter = _limiter if key is not None else _requester_limiter
+                response.headers["X-RateLimit-Limit"] = str(limiter.max_requests)
+                response.headers["X-RateLimit-Remaining"] = str(
+                    limiter.remaining(key if key is not None else requester_key)
+                )
+                response.headers["X-RateLimit-Reset"] = str(limiter.window_seconds)
 
-        response = await call_next(request)
-        remaining = _limiter.remaining(key)
-        response.headers["X-RateLimit-Limit"] = str(_limiter.max_requests)
-        response.headers["X-RateLimit-Remaining"] = str(remaining)
-        response.headers["X-RateLimit-Reset"] = str(_limiter.window_seconds)
+        # Preserve credential/public headers while exposing the independent
+        # requester allowance. On 429, X-RateLimit-* describes the blocking cap.
+        response.headers["X-RequesterRateLimit-Limit"] = str(_requester_limiter.max_requests)
+        response.headers["X-RequesterRateLimit-Remaining"] = str(
+            _requester_limiter.remaining(requester_key)
+        )
+        response.headers["X-RequesterRateLimit-Reset"] = str(_requester_limiter.window_seconds)
         return response
