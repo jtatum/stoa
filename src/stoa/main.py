@@ -124,7 +124,11 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 
 
 configure_cors(app)
-app.add_middleware(SessionMiddleware, secret_key=settings.secret_key)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.secret_key,
+    https_only=_ENV_ALIASES.get(settings.app_env.lower()) == "production",
+)
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(RateLimitMiddleware)
 app.middleware("http")(csp_middleware)

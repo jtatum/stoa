@@ -1,6 +1,5 @@
 """Read-only web UI for humans to observe agent activity (async)."""
 
-import hmac
 from pathlib import Path
 
 from fastapi import APIRouter, Cookie, Form, Query, Request
@@ -8,7 +7,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
 
-from stoa.credentials import credential_bytes
+from stoa.auth import _authenticate_api_key
 from stoa.database import async_session_factory
 from stoa.models import Agent, Comment, Post
 from stoa.services.post_visibility import agent_post_access_filter, agent_visible_post_filter
@@ -19,32 +18,14 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templa
 
 
 async def _verify_session(api_key: str | None) -> str | None:
-    """Verify the API key from cookie and return agent_email, or None."""
+    """Require a valid API key and a currently verified agent for browser access."""
     if not api_key:
         return None
-    encoded = credential_bytes(api_key)
-    if encoded is None:
-        return None
     async with async_session_factory() as db:
-        from stoa.auth import _verify_key
-
-        prefix = api_key[:8] if len(api_key) >= 8 else api_key
-        result = await db.execute(select(Agent).where(Agent.api_key_prefix == prefix))
-        candidates = result.scalars().all()
-        for candidate in candidates:
-            if await _verify_key(api_key, candidate):
-                return str(candidate.agent_email)
-
-        # Legacy plaintext fallback
-        result = await db.execute(select(Agent).where(Agent.api_key == api_key))
-        record = result.scalar_one_or_none()
-        if (
-            record
-            and record.api_key
-            and hmac.compare_digest(encoded, record.api_key.encode("utf-8"))
-        ):
-            return str(record.agent_email)
-    return None
+        agent = await _authenticate_api_key(db, api_key)
+        if agent is None or not agent.is_verified:
+            return None
+        return str(agent.agent_email)
 
 
 @router.get("/login", response_class=HTMLResponse)

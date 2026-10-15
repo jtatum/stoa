@@ -33,9 +33,13 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8000"
 
     # --- Rate limiting (issue #21) ---
-    # General API rate limit (admin-key requests bypass only on /api/admin).
+    # Credential/public-read limits (validated admin keys bypass only on /api/admin).
     rate_limit_max: int = 60
     rate_limit_window_seconds: int = 60
+    # Independent API requester budget, charged before credential buckets or
+    # authentication. Higher default accommodates clients sharing a public IP.
+    rate_limit_requester_max: int = Field(default=300, gt=0)
+    rate_limit_requester_window_seconds: int = Field(default=60, gt=0)
     # Per-process identity cap for each in-memory limiter. New identities
     # receive 429 at capacity until an inactive bucket expires.
     rate_limit_max_buckets: int = Field(default=10_000, gt=0)
