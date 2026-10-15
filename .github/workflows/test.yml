@@ -1,8 +1,4 @@
-# CI pipeline — lint + type check + test + coverage gates.
-#
-# Closes issue #3 (CI/CD Pipeline). Implements CLAUDE.md "Phase 1 MVP" gate:
-# all tests must pass + 100% coverage on src/stoa/security.py + >80% overall
-# before any PR can be approved.
+# CI pipeline: all validation gates precede deployment of the scanned image.
 #
 # ── Security hardening (apply to every workflow in this repo) ──
 # 1. Actions pinned to commit SHA (NOT floating tags) — supply-chain defense.
@@ -27,7 +23,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -54,10 +50,26 @@ jobs:
       - name: ruff format check
         run: ruff format --check src/ tests/
 
-  security-scan:
-    name: Dependency vulnerability scan
+  lock-audit:
+    name: Lock audit (${{ matrix.project }}, py${{ matrix.python-version }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: server
+            directory: .
+            python-version: "3.12"
+          - project: server
+            directory: .
+            python-version: "3.14"
+          - project: client
+            directory: clients/python
+            python-version: "3.10"
+          - project: client
+            directory: clients/python
+            python-version: "3.14"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -69,14 +81,134 @@ jobs:
         with:
           enable-cache: false
 
-      - name: Install dependencies
-        run: uv sync --all-extras --no-install-project
-
-      - name: Run pip-audit
+      - name: Audit the committed lockfile, including development dependencies
+        working-directory: ${{ matrix.directory }}
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
         run: |
           set -euo pipefail
-          uv pip install pip-audit
-          uv run --no-sync pip-audit --strict
+          uv export --locked --all-extras --all-groups --no-emit-project \
+            --format requirements.txt --output-file "$RUNNER_TEMP/audit-requirements.txt"
+          uv tool run pip-audit==2.10.1 --strict --disable-pip --no-deps \
+            --requirement "$RUNNER_TEMP/audit-requirements.txt"
+
+  security-scan:
+    # Preserve the status name required by the existing main ruleset.
+    name: Dependency vulnerability scan
+    if: always()
+    needs: lock-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Require every lock audit to succeed
+        env:
+          RESULT: ${{ needs.lock-audit.result }}
+        run: test "$RESULT" = success
+
+  go-security:
+    name: Go tests and vulnerability check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: clients/go
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: Test Go client and check reachable vulnerabilities
+        run: |
+          set -euo pipefail
+          go test ./...
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          govulncheck ./...
+
+  image:
+    name: Runtime image scan and smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      IMAGE: stoa:ci-${{ github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build final runtime image
+        run: docker build --pull --platform linux/amd64 --tag "$IMAGE" .
+
+      - name: Scan final image for OS and application vulnerabilities
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439  # v7.4.2
+        with:
+          image: ${{ env.IMAGE }}
+          grype-version: v0.120.1
+          fail-build: true
+          severity-cutoff: high
+          # Unfixed distro findings remain in JSON ignoredMatches for review.
+          only-fixed: true
+          output-format: json
+          output-file: image-vulnerabilities.json
+
+      - name: Upload image vulnerability report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: image-vulnerabilities
+          path: image-vulnerabilities.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Verify non-root startup, migrations, and health
+        run: bash scripts/smoke-image.sh "$IMAGE"
+
+      - name: Save the validated image for deployment
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          docker save "$IMAGE" | gzip > "$RUNNER_TEMP/runtime-image.tar.gz"
+
+      - name: Upload deployment image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: runtime-image-${{ github.sha }}
+          path: ${{ runner.temp }}/runtime-image.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  sast:
+    # Keep this job's existing status name for branch protection, too.
+    name: Semgrep security scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@713efdd345f3035192eaa63f56867b88e63e4e5d  # v1
+        with:
+          config: >-
+            p/security-audit
+            p/python
+            p/sql-injection
+            p/xss
+            p/secrets
+        env:
+          SEMGREP_RULES: auto
 
   typecheck:
     name: Type check (mypy, py${{ matrix.python-version }})
@@ -100,11 +232,11 @@ jobs:
       - name: Install dependencies
         run: |
           set -euo pipefail
-          uv sync --all-extras
+          uv sync --locked --all-extras
           uv pip install types-bleach types-Markdown
 
       - name: mypy
-        run: uv run mypy src/stoa/
+        run: uv run --no-sync mypy src/stoa/
 
   test:
     name: Tests (py${{ matrix.python-version }})
@@ -112,7 +244,7 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        python-version: ["3.12"]
+        python-version: ["3.12", "3.14"]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -126,12 +258,12 @@ jobs:
           enable-cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install dependencies
-        run: uv sync --all-extras
+        run: uv sync --locked --all-extras
 
       - name: Run tests + enforce coverage gates
         run: |
           set -euo pipefail
-          uv run pytest tests/ \
+          uv run --no-sync pytest tests/ \
             --cov=stoa \
             --cov-report=term-missing \
             --cov-report=xml \
@@ -149,15 +281,37 @@ jobs:
             echo "::error::tests/test_security.py is missing — security gate cannot run"
             exit 1
           }
-          uv run pytest tests/test_security.py \
+          uv run --no-sync pytest tests/test_security.py \
             --cov=stoa.security \
             --cov-fail-under=100 \
             -q
 
       - name: Upload coverage XML as artifact
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v6.1.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: coverage-xml-py${{ matrix.python-version }}
           path: coverage.xml
           retention-days: 7
+
+  required-checks:
+    name: Required checks
+    if: always()
+    needs: [lint, security-scan, go-security, image, sast, typecheck, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Require every validation job to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS" | jq -e 'all(.[]; .result == "success")'
+
+  deploy:
+    name: Production
+    needs: required-checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/fly-deploy.yml
+    secrets:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
