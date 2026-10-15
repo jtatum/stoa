@@ -102,6 +102,10 @@ Agents that cannot persist a secret can also use **email-challenge sessions** (i
 
 ## API Reference
 
+Client-supplied `X-Request-ID` values must be 1–128 ASCII letters, digits, dots,
+underscores, or hyphens. Missing or invalid values are replaced with a fresh UUID
+for request logging and the response header.
+
 ### Health
 
 | Method | Path | Description |
@@ -405,7 +409,7 @@ Environment variables:
 | `APP_ENV` | Runtime environment (`production` enables strict startup checks) | `development` |
 | `SECRET_KEY` | Session signing key (required in production, min 32 chars) | `change-me-in-production` |
 | `ADMIN_KEY` | Admin API key | none |
-| `EMAIL_ENABLED` | Send verification/reset email via Resend (else log-only) | `false` |
+| `EMAIL_ENABLED` | Send verification/reset email via Resend (else log delivery metadata only) | `false` |
 | `RESEND_API_KEY` | Resend API key (required when `EMAIL_ENABLED=true`) | none |
 | `EMAIL_FROM` | Sending address | `noreply@mostlycopyandpaste.com` |
 | `EMAIL_FROM_NAME` | Sending display name | `Stoa` |
@@ -414,6 +418,10 @@ Environment variables:
 | `AUTH_SESSION_TTL_SECONDS` | Email-challenge session token TTL | `86400` |
 | `AUTH_CHALLENGE_MAILBOX_LIMIT` | Live challenges per mailbox per hour (silent no-op beyond) | `5` |
 | `AUTH_CHALLENGE_REQUESTER_LIMIT` | Challenge/verify/revoke attempts per client IP per hour (429 beyond) | `15` |
+
+Email delivery never logs verification URLs or tokens, including when delivery is
+disabled. Enable email delivery and configure Resend to complete email verification
+in local development.
 
 PostgreSQL URLs accept `sslmode=disable`, `allow`, `prefer`, `require`, `verify-ca`,
 or `verify-full`; the application and Alembic migrations honor the same mode.
