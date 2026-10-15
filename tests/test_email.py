@@ -57,22 +57,31 @@ async def test_disabled_does_not_send(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_disabled_human_verification_logs_complete_ui_link(monkeypatch, caplog):
-    """Development mode exposes the otherwise-undeliverable verification URL."""
-    monkeypatch.setattr(email_mod.settings, "email_enabled", False)
+@pytest.mark.parametrize("is_human", [False, True], ids=["agent", "human"])
+@pytest.mark.parametrize("email_enabled", [False, True], ids=["disabled", "enabled"])
+async def test_verification_secrets_are_not_logged(monkeypatch, caplog, is_human, email_enabled):
+    """Verification links belong only in delivered email, including in development."""
+    monkeypatch.setattr(email_mod.settings, "email_enabled", email_enabled)
+    monkeypatch.setattr(email_mod.settings, "resend_api_key", "re_test_key")
     monkeypatch.setattr(email_mod.settings, "public_base_url", "http://localhost:8000/")
+    monkeypatch.setattr(email_mod.httpx, "AsyncClient", _FakeAsyncClient)
+    token = "secret-verification-token"
 
-    with caplog.at_level(logging.INFO, logger="stoa.email"):
+    with caplog.at_level(logging.DEBUG, logger="stoa.email"):
         ok = await email_mod.send_verification_email(
-            to="human@example.com",
-            token="local-human-token",
-            is_human=True,
+            to="a@example.com",
+            token=token,
+            is_human=is_human,
         )
 
     assert ok is True
-    assert (
-        "Verification URL for human@example.com: http://localhost:8000/ui/verify/local-human-token"
-    ) in caplog.text
+    assert token not in caplog.text
+    assert "http://localhost:8000/" not in caplog.text
+    if email_enabled:
+        assert _FakeAsyncClient.last_call is not None
+    else:
+        assert _FakeAsyncClient.last_call is None
+        assert "Email disabled; not sending." in caplog.text
 
 
 @pytest.mark.anyio

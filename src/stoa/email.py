@@ -2,7 +2,8 @@
 
 Design notes:
 - When ``settings.email_enabled`` is False (default, dev/test/CI), no network
-  call is made: the message is logged and the function returns True. This keeps
+  call is made: only delivery metadata is logged and the function returns True.
+  Email bodies, verification URLs, and tokens are never logged. This keeps
   local dev and the test suite working without credentials.
 - When enabled, we POST to the Resend REST API with httpx (already a dependency;
   no extra SDK). A missing API key while enabled is a configuration error.
@@ -40,7 +41,7 @@ async def send_email(
 ) -> bool:
     """Send a single transactional email.
 
-    Returns True on success (or when email is disabled and the message is
+    Returns True on success (or when email is disabled and delivery metadata is
     logged), False on a delivery failure. Never raises for provider/transport
     errors so the caller's request flow is unaffected. Subject line breaks
     are flattened before logging or sending.
@@ -101,11 +102,6 @@ def _verification_url(token: str, *, is_human: bool = False) -> str:
 async def send_verification_email(*, to: str, token: str, is_human: bool = False) -> bool:
     """Send the account verification email for an agent or human user."""
     url = _verification_url(token, is_human=is_human)
-    if not settings.email_enabled:
-        # Development-only recovery path: the URL contains the verification
-        # token by design and is never logged when outbound email is enabled.
-        # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure -- explicitly expose local verification URL only when email delivery is disabled
-        logger.info("Verification URL for %s: %s", to, url)
     who = "your Stoa account" if is_human else "your Stoa agent"
     subject = "Verify your Stoa account"
     html = (

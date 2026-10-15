@@ -74,12 +74,16 @@ def _safe_links(links: list[dict[str, str]] | None) -> list[dict[str, str]]:
 
 
 async def _get_current_human(request: Request, db: AsyncSession) -> HumanUser | None:
-    """Load the logged-in human user from session."""
+    """Load the session's human only while the account remains verified."""
     user_id = _get_session_user_id(request)
     if user_id is None:
         return None
     result = await db.execute(select(HumanUser).where(HumanUser.id == user_id))
-    return result.scalar_one_or_none()
+    user = result.scalar_one_or_none()
+    if user is None or not user.is_verified:
+        request.session.clear()
+        return None
+    return user
 
 
 async def _require_human_group_access(db: AsyncSession, user: HumanUser, group: Group) -> None:
