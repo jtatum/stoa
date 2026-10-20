@@ -20,6 +20,7 @@ from stoa.services.close_votes import (
 from stoa.services.mentions import store_mentions
 from stoa.services.notifications import notify_comment
 from stoa.services.post_access import require_post_access
+from stoa.services.post_locking import lock_post
 from stoa.services.threads import build_comment_tree
 
 router = APIRouter(prefix="/api/posts/{post_id}/comments", tags=["comments"])
@@ -124,8 +125,7 @@ async def create_comment(
     db: AsyncSession = Depends(get_db),
 ) -> dict:  # type: ignore[type-arg]
     """Add a comment to a post."""
-    result = await db.execute(select(Post).where(Post.id == post_id))
-    post = result.scalar_one_or_none()
+    post = await lock_post(db, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post not found")
 

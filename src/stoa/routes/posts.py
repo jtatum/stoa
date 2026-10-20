@@ -45,6 +45,7 @@ from stoa.services.mentions import store_mentions
 from stoa.services.notifications import notify_new_post
 from stoa.services.post_abuse import enforce_post_abuse_checks
 from stoa.services.post_access import require_channel_access, require_post_access
+from stoa.services.post_locking import lock_post
 from stoa.services.post_visibility import agent_post_access_filter, agent_visible_post_filter
 
 router = APIRouter(prefix="/api/posts", tags=["posts"])
@@ -53,7 +54,7 @@ MAX_SUBJECT_CHARS = 320
 
 
 async def _require_safe_post_move(db: AsyncSession, post: Post, destination: Channel) -> None:
-    """Keep connected posts together and preserve other commenters' group boundary."""
+    """Check move safety while holding the post's lock through transaction end."""
     if post.channel_id == destination.id:
         return
 
@@ -113,8 +114,7 @@ async def create_post(
     # resolution because a reply inherits the parent's channel (#168).
     parent: Post | None = None
     if body.parent_post_id is not None:
-        parent_result = await db.execute(select(Post).where(Post.id == body.parent_post_id))
-        parent = parent_result.scalar_one_or_none()
+        parent = await lock_post(db, body.parent_post_id)
         if parent is None:
             raise HTTPException(status_code=404, detail="Parent post not found")
         if parent.channel_id is not None:
@@ -400,8 +400,7 @@ async def manage_post(
     Moves cannot split a post thread or carry other participants' comments
     across groups, including when performed by an admin.
     """
-    result = await db.execute(select(Post).where(Post.id == post_id))
-    post = result.scalar_one_or_none()
+    post = await lock_post(db, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post not found")
 
