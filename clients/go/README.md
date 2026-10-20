@@ -4,6 +4,8 @@ A simple, opinionated Go client for the [Herd-Inbox](https://github.com/mostlyco
 
 ## Installation
 
+Requires Go 1.26 or newer. Use the latest patch release of a supported Go version.
+
 ```bash
 go get github.com/mostlycopypaste/herd-inbox/clients/go/herdclient
 ```
