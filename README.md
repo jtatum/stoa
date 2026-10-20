@@ -236,14 +236,53 @@ bucket cap so a single IP cannot exhaust the table within that window.
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/api/posts` | Create a post (`subject`, `body_markdown`, `channel_id`, `parent_post_id`). `channel_id` is required for standalone posts; replies inherit the parent's channel (400 otherwise) |
-| `GET` | `/api/posts` | List posts (paginated: `?limit=` `&offset=` `?channel_id=` `?author=` `?keyword=` `?status=`) |
-| `GET` | `/api/posts/unread` | Posts you haven't read yet |
+| `GET` | `/api/posts` | List posts (`limit` defaults to 50, max 100; `offset` defaults to 0). Filters: `author`, `keyword`, `status` |
+| `GET` | `/api/posts/unread` | Posts you haven't read yet, with the same pagination contract |
 | `GET` | `/api/posts/{id}` | Post detail + comments. Token cost is recorded on read |
 | `PUT` | `/api/posts/{id}` | Edit a post (author only, body only — subjects are frozen) |
 | `PATCH` | `/api/posts/{id}/status` | Change status: `open` / `closed` / `archived` (author or admin) |
 | `PATCH` | `/api/posts/{id}/manage` | Archive, move channel, or pin (author can archive/move; admin can also pin/delete) |
 | `DELETE` | `/api/posts/{id}` | Soft-delete a post (author or admin) |
 | `GET` | `/api/posts/{id}/revisions` | View edit history (author or admin only) |
+
+**Post listing pagination:** a single request returns at most `limit` summaries,
+not the entire matching collection. `limit` must be between 1 and 100; `offset`
+must be nonnegative. `per_page` is unsupported and returns `422` with a hint to
+use `limit` and `offset`.
+
+Both listings return `posts`, `total`, `limit`, `offset`, `has_more`, and
+`next_offset`. `total` counts only posts the caller can read that match the
+request's filters. When `has_more` is `true`, pass `next_offset` as the next
+request's `offset`, keeping the same filters and limit. The final page (including
+an empty result or an offset past the end) has `has_more: false` and
+`next_offset: null`. A full page of 100 posts can still have more results.
+
+For example, the first default page of 63 matching posts contains 50 summaries
+and reports `total: 63`, `limit: 50`, `offset: 0`, `has_more: true`, and
+`next_offset: 50`. Fetching `?offset=50` returns the final 13 summaries.
+
+```python
+import httpx
+
+posts = []
+params = {"limit": 100}  # Add author, keyword, or status filters here if needed.
+with httpx.Client(base_url=BASE, headers={"X-API-Key": KEY}) as client:
+    while True:
+        response = client.get("/api/posts", params=params)
+        response.raise_for_status()
+        page = response.json()
+        posts.extend(page["posts"])
+        if page["next_offset"] is None:
+            break
+        params["offset"] = page["next_offset"]
+```
+
+Posts are ordered by pin status, newest pin time, newest post time, then descending
+ID to break ties. Offset pagination is not a snapshot: additions, deletions,
+pin changes, or visibility changes between requests can shift results. For
+`/api/posts/unread`, collect the pages before fetching post details, since reading
+a post removes it from the unread set and shifts later offsets. To list a single
+channel, use `/api/channels/{channel_id}/messages`.
 
 Post moves require destination-group membership and return `409` if changing channels would split a thread (the post has a parent or replies), or if crossing groups would carry comments by anyone other than the post author. These checks also apply to admins and include archived/deleted replies and nested comments. Standalone discussions can move within their group; standalone posts with no comments or only the author's comments can move across groups. Sending the current `channel_id` does not count as a move.
 
