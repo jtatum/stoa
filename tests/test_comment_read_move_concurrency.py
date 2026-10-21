@@ -7,10 +7,12 @@ import asyncio
 from contextlib import asynccontextmanager
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stoa.config import settings
+from stoa.main import app
 from stoa.models import Comment, Post
 from stoa.routes import posts, web
 
@@ -222,3 +224,96 @@ async def test_reader_waiting_on_move_rechecks_audience(
         if reader_task is not None:
             tasks.append(reader_task)
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10)
+
+
+@pytest.mark.parametrize("surface", ["comments", "thread", "post", "public", "web", "human"])
+async def test_slow_response_send_does_not_hold_post_lock(
+    setup_db, postgres_client, monkeypatch, admin_headers, surface
+):
+    client, _ = postgres_client
+    source_group, source = await _group(
+        client, "Source A", visibility="public" if surface == "public" else "private"
+    )
+    await _invite(client, source_group, "bob@herd.ai")
+    destination_group, destination = await _group(client, "Private B")
+    await _invite(client, destination_group, "carol@herd.ai")
+    post_id = await _post(client, source)
+    if surface == "public":
+        pinned = await client.patch(
+            f"/api/posts/{post_id}/manage",
+            headers={**ALICE, **admin_headers},
+            json={"pinned": True},
+        )
+        assert pinned.status_code == 200, pinned.text
+    elif surface == "web":
+        monkeypatch.setattr(web, "async_session_factory", setup_db)
+        client.cookies.set("stoa_session", "bob-key")
+    elif surface == "human":
+        from .test_human_ui import _create_verified_human
+
+        async with setup_db() as db:
+            await _create_verified_human(db, email="bob@herd.ai")
+            await db.commit()
+        login = await client.post(
+            "/ui/login",
+            headers={"Origin": settings.public_base_url},
+            data={"email": "bob@herd.ai", "password": "testpass123"},
+        )
+        assert login.status_code == 303, login.text
+
+    url = {
+        "comments": f"/api/posts/{post_id}/comments",
+        "thread": f"/api/posts/{post_id}/thread",
+        "post": f"/api/posts/{post_id}",
+        "public": f"/api/public/posts/{post_id}",
+        "web": f"/web/posts/{post_id}",
+        "human": f"/ui/posts/{post_id}",
+    }[surface]
+    headers = BOB if surface in ("comments", "thread", "post") else {}
+    response_ready = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_send_app(scope, receive, send):
+        async def stall_body(message):
+            if message["type"] == "http.response.body":
+                response_ready.set()
+                await release.wait()
+            await send(message)
+
+        await app(scope, receive, stall_body)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=slow_send_app), base_url="http://test"
+    ) as slow:
+        slow.cookies.update(client.cookies)
+        pending = asyncio.create_task(slow.get(url, headers=headers))
+        move_task = None
+        try:
+            await asyncio.wait_for(response_ready.wait(), timeout=5)
+            move_task = asyncio.create_task(
+                client.patch(
+                    f"/api/posts/{post_id}/manage",
+                    headers=ALICE,
+                    json={"channel_id": destination},
+                )
+            )
+            # This must finish before the pending response body is sent.
+            moved = await asyncio.wait_for(asyncio.shield(move_task), timeout=5)
+            assert moved.status_code == 200, moved.text
+            secret = "Comment created after slow response began"
+            written = await client.post(
+                f"/api/posts/{post_id}/comments",
+                headers=CAROL,
+                json={"body_markdown": secret},
+            )
+            assert written.status_code == 201, written.text
+        finally:
+            release.set()
+            tasks = [pending]
+            if move_task is not None:
+                tasks.append(move_task)
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10)
+
+    response = pending.result()
+    assert response.status_code == 200, response.text
+    assert secret not in response.text

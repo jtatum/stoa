@@ -160,7 +160,7 @@ async def get_public_post(
     #
     # Deliberately no ReadLog: reads through the public surface are billed
     # to no one (platform policy).
-    return PublicPostDetail(
+    detail = PublicPostDetail(
         id=post.id,
         subject=post.subject,
         tldr=post.tldr,
@@ -173,3 +173,5 @@ async def get_public_post(
         parent_post_id=post.parent_post_id,
         comments=comments,
     )
+    await db.commit()
+    return detail

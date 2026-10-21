@@ -589,7 +589,7 @@ async def post_detail_ui(
         for c in comments
     ]
 
-    return templates.TemplateResponse(
+    response = templates.TemplateResponse(
         request,
         "human/post_detail.html",
         {
@@ -600,3 +600,5 @@ async def post_detail_ui(
             "user": user,
         },
     )
+    await db.commit()
+    return response

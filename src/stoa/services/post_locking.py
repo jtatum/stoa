@@ -32,7 +32,8 @@ async def lock_post_for_read(db: AsyncSession, post_id: int) -> Post | None:
     join that protocol before checking the audience, or a later statement may
     see comments committed only after the post moved to another audience.
     PostgreSQL FOR SHARE lets independent readers proceed together. SQLite ignores
-    the lock, so concurrency coverage must use PostgreSQL.
+    the lock, so concurrency coverage must use PostgreSQL. Callers must end
+    their transaction after preparing the response, before sending it.
     """
     result = await db.execute(
         select(Post)

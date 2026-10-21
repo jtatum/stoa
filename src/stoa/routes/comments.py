@@ -236,12 +236,14 @@ async def list_comments(
         select(Comment).where(Comment.post_id == post_id).order_by(Comment.timestamp)
     )
     comments = comment_result.scalars().all()
-    return [
+    response = [
         CommentOut.model_validate(c, from_attributes=True)
         .model_copy(update={"token_cost": count_tokens(str(c.body_markdown))})
         .model_dump()
         for c in comments
     ]
+    await db.commit()
+    return response
 
 
 @router.delete("/{comment_id}", status_code=204)
@@ -310,7 +312,7 @@ async def get_thread(
 
     serialized_comments = [_serialize(node) for node in tree]
 
-    return {
+    response = {
         "post": {
             "id": post.id,
             "subject": post.subject,
@@ -327,3 +329,5 @@ async def get_thread(
         },
         "comments": serialized_comments,
     }
+    await db.commit()
+    return response

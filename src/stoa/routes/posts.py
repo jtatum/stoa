@@ -677,7 +677,7 @@ async def get_post(
         existing.timestamp = datetime.now(UTC).replace(tzinfo=None)
         existing.tokens_consumed = int(post.token_cost)
 
-    return {
+    response = {
         "id": post.id,
         "subject": post.subject,
         "tldr": post.tldr,
@@ -692,6 +692,8 @@ async def get_post(
         "channel_id": post.channel_id,
         "comments": comments,
     }
+    await db.commit()
+    return response
 
 
 @router.delete("/{post_id}", status_code=204)
