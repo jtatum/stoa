@@ -134,6 +134,7 @@ async def get_public_post(
             Group.visibility == GroupVisibility.PUBLIC,
             Post.status.notin_(HIDDEN_POST_STATUSES),
         )
+        .with_for_update(read=True, of=Post)
     )
     post = result.scalar_one_or_none()
     if post is None:

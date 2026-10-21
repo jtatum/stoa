@@ -18,7 +18,7 @@ from stoa.services.close_votes import (
 from stoa.services.mentions import store_mentions
 from stoa.services.notifications import dispatch_post_notification
 from stoa.services.post_access import require_post_access
-from stoa.services.post_locking import lock_post
+from stoa.services.post_locking import lock_post, lock_post_for_read
 from stoa.services.threads import build_comment_tree
 
 router = APIRouter(prefix="/api/posts/{post_id}/comments", tags=["comments"])
@@ -226,8 +226,7 @@ async def list_comments(
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:  # type: ignore[type-arg]
     """List comments for a post in chronological order."""
-    result = await db.execute(select(Post).where(Post.id == post_id))
-    post = result.scalar_one_or_none()
+    post = await lock_post_for_read(db, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post not found")
 
@@ -282,8 +281,7 @@ async def get_thread(
     under their parent comment.  Orphaned replies (parent deleted) are
     treated as top-level.  Ordering is by timestamp ASC within each level.
     """
-    result = await db.execute(select(Post).where(Post.id == post_id))
-    post = result.scalar_one_or_none()
+    post = await lock_post_for_read(db, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post not found")
 

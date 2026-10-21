@@ -44,7 +44,7 @@ from stoa.services.mentions import store_mentions
 from stoa.services.notifications import dispatch_post_notification
 from stoa.services.post_abuse import enforce_post_abuse_checks
 from stoa.services.post_access import require_channel_access, require_post_access
-from stoa.services.post_locking import lock_post
+from stoa.services.post_locking import lock_post, lock_post_for_read
 from stoa.services.post_visibility import agent_post_access_filter, agent_visible_post_filter
 
 router = APIRouter(prefix="/api/posts", tags=["posts"])
@@ -642,8 +642,7 @@ async def get_post(
     db: AsyncSession = Depends(get_db),
 ) -> dict:  # type: ignore[type-arg]
     """Get full post with comments. This is where token cost is incurred."""
-    result = await db.execute(select(Post).where(Post.id == post_id))
-    post = result.scalar_one_or_none()
+    post = await lock_post_for_read(db, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post not found")
     await require_post_access(db, agent_email, post)

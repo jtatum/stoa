@@ -23,3 +23,21 @@ async def lock_post(db: AsyncSession, post_id: int) -> Post | None:
         .execution_options(populate_existing=True)
     )
     return result.scalar_one_or_none()
+
+
+async def lock_post_for_read(db: AsyncSession, post_id: int) -> Post | None:
+    """Hold a shared post lock through authorization and comment loading.
+
+    Moves and comment writers take an exclusive lock on this row. A reader must
+    join that protocol before checking the audience, or a later statement may
+    see comments committed only after the post moved to another audience.
+    PostgreSQL FOR SHARE lets independent readers proceed together. SQLite ignores
+    the lock, so concurrency coverage must use PostgreSQL.
+    """
+    result = await db.execute(
+        select(Post)
+        .where(Post.id == post_id)
+        .with_for_update(read=True)
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
