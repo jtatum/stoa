@@ -25,7 +25,7 @@ an email-challenge session must never mint posting or key-lifecycle authority
 import logging
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stoa.auth import _authenticate_api_key, extract_api_credential
@@ -37,7 +37,6 @@ from stoa.models import (
     CHALLENGE_PURPOSE_REVOKE,
     Agent,
     AuditLog,
-    Post,
 )
 from stoa.rate_limit import RateLimiter, _extract_client_ip
 from stoa.schemas import (
@@ -62,6 +61,7 @@ from stoa.services.auth_sessions import (
     resolve_agent,
     revoke_sessions,
 )
+from stoa.services.post_visibility import count_own_visible_posts
 
 router = APIRouter(prefix="/api/auth", tags=["auth-sessions"])
 logger = logging.getLogger(__name__)
@@ -256,10 +256,7 @@ async def verify_challenge_route(
         )
         raise HTTPException(status_code=401, detail="Verification failed")
 
-    count_result = await db.execute(
-        select(func.count(Post.id)).where(Post.author == agent.agent_email)
-    )
-    post_count = count_result.scalar() or 0
+    post_count = await count_own_visible_posts(db, agent.agent_email)
     profile = AgentProfile(
         id=agent.id,
         agent_email=agent.agent_email,
