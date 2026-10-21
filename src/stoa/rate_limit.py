@@ -12,9 +12,13 @@ of whether they bypass the limiter.
 
 The public read surface (``/api/public/*``) is always keyed on client IP:
 those routes do not authenticate credentials, so arbitrary headers must
-not replace the IP identity. All API requests consume an independent IP budget
-before credential buckets are allocated or authentication runs. Requests with
-no usable client IP share one bounded fallback identity in each limiter.
+not replace the IP identity. All API requests and browser authentication attempts
+consume an independent IP budget before credential buckets are allocated or
+authentication runs. Requests with no usable client IP share one bounded fallback
+identity in each limiter.
+
+Human login, registration, and verification resend POSTs share that requester
+budget, before body parsing, database access, bcrypt, or email delivery.
 """
 
 import hashlib
@@ -345,7 +349,28 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Include anonymous API requests (even missing/malformed credentials),
         # and retain the existing coverage of credential-bearing non-API paths.
         path = request.url.path
-        if key is None and path != "/api" and not path.startswith("/api/"):
+        # Charge login POSTs before parsing the form body, and cookie-bearing
+        # web requests before session verification opens a DB session or runs
+        # bcrypt. Both use the same requester budget as API authentication.
+        browser_auth = (request.method == "POST" and path == "/web/login") or (
+            path.startswith("/web/") and bool(request.cookies.get("stoa_session"))
+        )
+        # Human auth uses form/JSON bodies rather than credential headers.
+        # Charge attempts before parsing those bodies or allocating mailbox
+        # buckets, so rotating email addresses cannot reset the IP allowance.
+        human_auth = request.method == "POST" and path in (
+            "/ui/login",
+            "/ui/register",
+            "/auth/register-human",
+            "/ui/resend-verification",
+        )
+        if (
+            key is None
+            and path != "/api"
+            and not path.startswith("/api/")
+            and not browser_auth
+            and not human_auth
+        ):
             return await call_next(request)
 
         client_ip = _extract_client_ip(request)
