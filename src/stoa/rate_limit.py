@@ -16,6 +16,9 @@ not replace the IP identity. All API requests and browser authentication attempt
 consume an independent IP budget before credential buckets are allocated or
 authentication runs. Requests with no usable client IP share one bounded fallback
 identity in each limiter.
+
+Human login, registration, and verification resend POSTs share that requester
+budget, before body parsing, database access, bcrypt, or email delivery.
 """
 
 import hashlib
@@ -352,7 +355,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         browser_auth = (request.method == "POST" and path == "/web/login") or (
             path.startswith("/web/") and bool(request.cookies.get("stoa_session"))
         )
-        if key is None and path != "/api" and not path.startswith("/api/") and not browser_auth:
+        # Human auth uses form/JSON bodies rather than credential headers.
+        # Charge attempts before parsing those bodies or allocating mailbox
+        # buckets, so rotating email addresses cannot reset the IP allowance.
+        human_auth = request.method == "POST" and path in (
+            "/ui/login",
+            "/ui/register",
+            "/auth/register-human",
+            "/ui/resend-verification",
+        )
+        if (
+            key is None
+            and path != "/api"
+            and not path.startswith("/api/")
+            and not browser_auth
+            and not human_auth
+        ):
             return await call_next(request)
 
         client_ip = _extract_client_ip(request)

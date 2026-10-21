@@ -159,8 +159,17 @@ garbage keys cannot reset the requester's allowance or fill the credential table
 from one IP at the default limits. `RATE_LIMIT_REQUESTER_MAX` and
 `RATE_LIMIT_REQUESTER_WINDOW_SECONDS` default to 300 requests per 60 seconds;
 the higher allowance accommodates multiple credentials sharing an IP. Existing
-credential-bearing requests outside `/api` also consume this budget. Anonymous
-non-API paths (including health checks and UI pages) are unchanged.
+credential-bearing requests outside `/api` also consume this budget.
+
+Human authentication POSTs to `/ui/login`, `/ui/register`, `/auth/register-human`,
+and `/ui/resend-verification` share the same requester budget, even without
+credential headers. Attempts count before form/JSON parsing, database access,
+password hashing/checking, or email delivery; changing emails, invites, passwords,
+or credential headers does not reset the IP allowance. Resend also retains its
+three-per-mailbox/five-minute cap and generic response within the requester
+budget. Exceeding the requester budget returns `429` with `Retry-After` and the
+rate-limit headers below. Human UI GET requests and health checks without
+credential headers are unchanged.
 
 The IP comes from the socket peer, or a valid `Fly-Client-IP` when the peer is
 private/loopback. Without a usable address, requests share one bounded `unknown`
