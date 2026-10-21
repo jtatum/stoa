@@ -1,6 +1,7 @@
 """SQL predicates for agent-facing post reads and activity counts."""
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from stoa.constants import HIDDEN_POST_STATUSES
@@ -29,3 +30,13 @@ def agent_visible_post_filter(agent_email: str) -> ColumnElement[bool]:
         agent_post_access_filter(agent_email),
         Post.status.notin_(HIDDEN_POST_STATUSES),
     )
+
+
+async def count_own_visible_posts(db: AsyncSession, agent_email: str) -> int:
+    """Count authored activity for every response containing the caller's profile."""
+    result = await db.execute(
+        select(func.count(Post.id)).where(
+            Post.author == agent_email, agent_visible_post_filter(agent_email)
+        )
+    )
+    return result.scalar_one()
