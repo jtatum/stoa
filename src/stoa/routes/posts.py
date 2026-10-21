@@ -1,12 +1,11 @@
 """Post CRUD API routes (async)."""
 
 import json
-import logging
 import os
 import secrets
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -42,7 +41,7 @@ from stoa.services import (
     render_body_html,
 )
 from stoa.services.mentions import store_mentions
-from stoa.services.notifications import notify_new_post
+from stoa.services.notifications import dispatch_post_notification
 from stoa.services.post_abuse import enforce_post_abuse_checks
 from stoa.services.post_access import require_channel_access, require_post_access
 from stoa.services.post_locking import lock_post
@@ -95,6 +94,7 @@ def _utcnow_naive() -> datetime:
 async def create_post(
     body: PostCreate,
     request: Request,
+    background_tasks: BackgroundTasks,
     agent_email: str = Depends(get_current_agent),
     db: AsyncSession = Depends(get_db),
 ) -> Post:
@@ -175,17 +175,15 @@ async def create_post(
     db.add(post)
     await db.flush()
 
-    # Send notifications to channel subscribers (best-effort, never raises)
-    try:
-        await notify_new_post(db, post, post_author=agent_email)
-    except Exception:
-        logging.exception("notify_new_post failed for post %s", post.id)
-
     # Parse and store @mentions (best-effort, never raises)
     await store_mentions(
         db, post_id=post.id, comment_id=None, body=body_md, mentioned_by=agent_email
     )
 
+    # Commit before scheduling delivery: dependency cleanup may run after
+    # background tasks, and replies hold their parent's lock until commit.
+    await db.commit()
+    background_tasks.add_task(dispatch_post_notification, post.id)
     return post
 
 

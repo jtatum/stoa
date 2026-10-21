@@ -2,29 +2,31 @@
 
 import asyncio
 import os
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 from fastapi import Request
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Response
 from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from stoa.database import Base, get_db
 from stoa.main import app
-from stoa.models import Comment, Post
+from stoa.models import Agent, AuditLog, Comment, Mention, Post, Subscription
 from stoa.routes import comments, messages, posts
+from stoa.services import notifications
 from stoa.services.post_locking import lock_post
 
 from .helpers import create_test_api_key
-from .test_post_moves import ALICE, BOB, CAROL, _comment, _group, _invite, _post
+from .test_post_moves import ALICE, BOB, CAROL, _channel, _comment, _group, _invite, _post
 
 pytestmark = pytest.mark.postgres
 
 
 @pytest.fixture(autouse=True)
-async def setup_db():
+async def setup_db(monkeypatch):
     """Override the shared SQLite fixture with a disposable PostgreSQL schema.
 
     Never fall back to the application's DATABASE_URL. Each request gets its
@@ -50,6 +52,7 @@ async def setup_db():
         },
     )
     sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(notifications, "async_session_factory", sessions)
     try:
         async with admin_engine.begin() as connection:
             await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
@@ -71,11 +74,16 @@ async def postgres_client(setup_db):
     backend_pids = {}
 
     async def request_db(request: Request):
-        async with setup_db.begin() as db:
-            operation = request.headers.get("X-Test-Operation")
-            if operation:
-                backend_pids[operation] = await db.scalar(text("SELECT pg_backend_pid()"))
-            yield db
+        async with setup_db() as db:
+            try:
+                operation = request.headers.get("X-Test-Operation")
+                if operation:
+                    backend_pids[operation] = await db.scalar(text("SELECT pg_backend_pid()"))
+                yield db
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
 
     previous_overrides = app.dependency_overrides.copy()
     app.dependency_overrides[get_db] = request_db
@@ -228,3 +236,186 @@ async def test_lock_refreshes_an_already_loaded_post(setup_db, postgres_client):
         locked = await lock_post(db, post_id)
         assert locked is cached
         assert locked.channel_id == destination
+
+
+async def _write_notified_content(
+    client: AsyncClient, kind: str, post_id: int, channel_id: int
+) -> Response:
+    body = {"body_markdown": "A committed contribution mentioning @alice@herd.ai"}
+    if kind == "comment":
+        return await client.post(f"/api/posts/{post_id}/comments", headers=BOB, json=body)
+    payload = {**body, "subject": "A notified post", "channel_id": channel_id}
+    if kind == "reply":
+        payload["parent_post_id"] = post_id
+    return await client.post("/api/posts", headers=BOB, json=payload)
+
+
+@pytest.mark.parametrize("writer", ["comment", "reply"])
+@pytest.mark.parametrize("concurrent", ["comment", "reply", "channel_reply", "move"])
+async def test_slow_notifications_do_not_hold_post_lock(
+    setup_db: async_sessionmaker[AsyncSession],
+    postgres_client: tuple[AsyncClient, dict[str, int]],
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+    concurrent: str,
+) -> None:
+    client, _ = postgres_client
+    group_id, source = await _group(client, "Source")
+    await _invite(client, group_id, "bob@herd.ai")
+    destination = await _channel(client, group_id)
+    post_id = await _post(client, source)
+    sending = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_email(**kwargs: object) -> bool:
+        if not sending.is_set():
+            sending.set()
+            await release.wait()
+        return True
+
+    monkeypatch.setattr(notifications.settings, "email_enabled", True)
+    monkeypatch.setattr(notifications, "send_email", slow_email)
+    original = asyncio.create_task(_write_notified_content(client, writer, post_id, source))
+    try:
+        await asyncio.wait_for(sending.wait(), timeout=5)
+        # Delivery has begun, but no request/notification connection is held.
+        assert setup_db.kw["bind"].pool.checkedout() == 0
+        async with setup_db() as db:
+            if writer == "comment":
+                assert await db.scalar(select(Comment.id).where(Comment.post_id == post_id))
+                bob_id = await db.scalar(select(Agent.id).where(Agent.agent_email == "bob@herd.ai"))
+                assert await db.scalar(
+                    select(Subscription.id).where(
+                        Subscription.agent_id == bob_id,
+                        Subscription.scope_type == "post",
+                        Subscription.scope_id == post_id,
+                    )
+                )
+            else:
+                assert await db.scalar(select(Post.id).where(Post.parent_post_id == post_id))
+            assert await db.scalar(select(Mention.id))
+
+        # These requests must finish while the first delivery is still paused.
+        async with asyncio.timeout(3):
+            if concurrent == "comment":
+                response = await client.post(
+                    f"/api/posts/{post_id}/comments",
+                    headers=ALICE,
+                    json={"body_markdown": "Another comment during email delivery"},
+                )
+            elif concurrent == "reply":
+                response = await client.post(
+                    "/api/posts",
+                    headers=ALICE,
+                    json={
+                        "subject": "Concurrent reply",
+                        "body_markdown": "A reply during email delivery",
+                        "parent_post_id": post_id,
+                    },
+                )
+            elif concurrent == "channel_reply":
+                response = await client.post(
+                    f"/api/channels/{source}/messages",
+                    headers=ALICE,
+                    json={
+                        "subject": "Concurrent channel reply",
+                        "body_markdown": "A channel reply during email delivery",
+                        "parent_id": post_id,
+                    },
+                )
+            else:
+                response = await client.patch(
+                    f"/api/posts/{post_id}/manage", headers=ALICE, json={"channel_id": destination}
+                )
+        expected = 409 if writer == "reply" else 200
+        assert response.status_code == (expected if concurrent == "move" else 201), response.text
+        assert not original.done()
+    finally:
+        release.set()
+        response = await asyncio.wait_for(original, timeout=5)
+    assert response.status_code == 201, response.text
+    async with setup_db() as db:
+        assert await db.scalar(
+            select(AuditLog.id).where(AuditLog.event_type == "notification_batch_sent")
+        )
+
+
+@pytest.mark.parametrize("writer", ["comment", "reply", "standalone"])
+async def test_failed_content_commit_never_dispatches_notifications(
+    setup_db: async_sessionmaker[AsyncSession],
+    postgres_client: tuple[AsyncClient, dict[str, int]],
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+) -> None:
+    client, _ = postgres_client
+    group_id, source = await _group(client, "Source")
+    await _invite(client, group_id, "bob@herd.ai")
+    post_id = await _post(client, source)
+    if writer == "standalone":
+        async with setup_db.begin() as db:
+            alice = (
+                await db.scalars(select(Agent).where(Agent.agent_email == "alice@herd.ai"))
+            ).one()
+            alice.notification_scope = "all"
+            db.add(Subscription(agent_id=alice.id, scope_type="channel", scope_id=source))
+    send = AsyncMock(return_value=True)
+    monkeypatch.setattr(notifications, "send_email", send)
+
+    async def fail_commit(db: AsyncSession) -> None:
+        raise RuntimeError("Simulated content commit failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AsyncSession, "commit", fail_commit)
+        with pytest.raises(RuntimeError, match="Simulated content commit failure"):
+            await _write_notified_content(client, writer, post_id, source)
+    send.assert_not_awaited()
+    async with setup_db() as db:
+        assert not await db.scalar(select(Comment.id))
+        assert not await db.scalar(select(Post.id).where(Post.author == "bob@herd.ai"))
+        assert not await db.scalar(select(Subscription.id).where(Subscription.scope_type == "post"))
+        assert not await db.scalar(select(Mention.id))
+
+
+@pytest.mark.parametrize("writer", ["comment", "reply"])
+@pytest.mark.parametrize("failure", ["send", "audit"])
+async def test_notification_failure_cannot_undo_content(
+    setup_db: async_sessionmaker[AsyncSession],
+    postgres_client: tuple[AsyncClient, dict[str, int]],
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+    failure: str,
+) -> None:
+    client, _ = postgres_client
+    group_id, source = await _group(client, "Source")
+    await _invite(client, group_id, "bob@herd.ai")
+    post_id = await _post(client, source)
+    send = AsyncMock(return_value=True)
+    if failure == "send":
+        send.side_effect = RuntimeError("Email provider unavailable")
+    monkeypatch.setattr(notifications, "send_email", send)
+    original_commit = AsyncSession.commit
+
+    async def fail_audit_commit(db: AsyncSession) -> None:
+        if failure == "audit" and any(
+            isinstance(row, AuditLog) and row.event_type == "notification_batch_sent"
+            for row in db.new
+        ):
+            raise RuntimeError("Notification audit unavailable")
+        await original_commit(db)
+
+    monkeypatch.setattr(AsyncSession, "commit", fail_audit_commit)
+    response = await _write_notified_content(client, writer, post_id, source)
+    assert response.status_code == 201, response.text
+    send.assert_awaited_once()
+    async with setup_db() as db:
+        model = Comment if writer == "comment" else Post
+        assert await db.get(model, response.json()["id"]) is not None
+        assert await db.scalar(select(Mention.id))
+        audit = await db.scalar(
+            select(AuditLog).where(AuditLog.event_type == "notification_batch_sent")
+        )
+        if failure == "audit":
+            assert audit is None
+        else:
+            assert audit is not None
+            assert "failed=1" in audit.details

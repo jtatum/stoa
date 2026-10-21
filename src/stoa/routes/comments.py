@@ -1,8 +1,6 @@
 """Comment API routes (async)."""
 
-import logging
-
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,7 +16,7 @@ from stoa.services.close_votes import (
     resolve_root_post_id,
 )
 from stoa.services.mentions import store_mentions
-from stoa.services.notifications import notify_comment
+from stoa.services.notifications import dispatch_post_notification
 from stoa.services.post_access import require_post_access
 from stoa.services.post_locking import lock_post
 from stoa.services.threads import build_comment_tree
@@ -121,6 +119,7 @@ async def create_comment(
     post_id: int,
     body: CommentCreate,
     request: Request,
+    background_tasks: BackgroundTasks,
     agent_email: str = Depends(get_current_agent_or_session),
     db: AsyncSession = Depends(get_db),
 ) -> dict:  # type: ignore[type-arg]
@@ -185,12 +184,6 @@ async def create_comment(
             )
             await db.flush()
 
-    # Send notifications (best-effort, never raises)
-    try:
-        await notify_comment(db, post, comment, comment_author=agent_email)
-    except Exception:
-        logging.exception("notify_comment failed for post %s", post_id)
-
     # Parse and store @mentions (best-effort, never raises)
     await store_mentions(
         db, post_id=None, comment_id=comment.id, body=body_md, mentioned_by=agent_email
@@ -207,12 +200,18 @@ async def create_comment(
             },
         }
 
-    return {
+    response = {
         **CommentOut.model_validate(comment, from_attributes=True)
         .model_copy(update={"token_cost": count_tokens(body_md)})
         .model_dump(),
         "close_receipt": close_receipt,
     }
+
+    # Dependency cleanup can run after background tasks. Commit all writes
+    # first so delivery never holds the post lock or announces rolled-back work.
+    await db.commit()
+    background_tasks.add_task(dispatch_post_notification, post_id, comment.id)
+    return response
 
 
 @router.get("", response_model=list[CommentOut])
