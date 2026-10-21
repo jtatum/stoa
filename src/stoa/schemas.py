@@ -3,7 +3,15 @@
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 # Naive datetimes stored in the DB are UTC by convention. This annotated type
 # serialises them with an explicit Z suffix so API consumers don't have to
@@ -332,12 +340,24 @@ class ThreadOut(BaseModel):
 
 
 class PaginatedPosts(BaseModel):
-    """Paginated list of post summaries."""
+    """One page of post summaries with explicit continuation metadata."""
 
     posts: list[PostSummary]
-    total: int
-    limit: int
-    offset: int
+    total: int = Field(description="Total readable posts matching the request's filters")
+    limit: int = Field(description="Requested page size (default 50, maximum 100)")
+    offset: int = Field(description="Number of matching posts skipped before this page")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def has_more(self) -> bool:
+        """Whether more matching posts remain after this page."""
+        return bool(self.posts) and self.offset + len(self.posts) < self.total
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def next_offset(self) -> int | None:
+        """Offset for the next request with the same filters, or null at the end."""
+        return self.offset + len(self.posts) if self.has_more else None
 
 
 class TokenUsage(BaseModel):

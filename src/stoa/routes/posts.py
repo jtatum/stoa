@@ -498,17 +498,42 @@ async def manage_post(
     }
 
 
-@router.get("", response_model=PaginatedPosts)
+def _reject_per_page(request: Request) -> None:
+    """Do not silently accept an unsupported page-size parameter."""
+    if "per_page" in request.query_params:
+        raise HTTPException(
+            status_code=422,
+            detail=[
+                {
+                    "type": "extra_forbidden",
+                    "loc": ["query", "per_page"],
+                    "msg": (
+                        "Unsupported parameter 'per_page'; use 'limit' (1-100, default 50) "
+                        "and 'offset' (default 0) instead"
+                    ),
+                }
+            ],
+        )
+
+
+@router.get("", response_model=PaginatedPosts, dependencies=[Depends(_reject_per_page)])
 async def list_posts(
     author: str | None = Query(default=None, max_length=255),
     keyword: str | None = Query(default=None, max_length=100),
-    limit: int = Query(default=50, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100, description="Page size; default 50, maximum 100"),
+    offset: int = Query(default=0, ge=0, description="Posts to skip; use next_offset to continue"),
     status: str | None = Query(default=None, max_length=20),
     agent_email: str = Depends(get_current_agent_or_session),
     db: AsyncSession = Depends(get_db),
 ) -> dict:  # type: ignore[type-arg]
-    """List readable posts with metadata and TLDR only (no body). Minimal token cost."""
+    """List readable posts with metadata and TLDR only (no body).
+
+    Returns one page, with limit=50 by default (maximum 100) and offset=0.
+    While has_more is true, request next_offset with the same filters and limit.
+    next_offset is null when no further posts remain. per_page is unsupported (422).
+    Pinned posts come first, then newest posts, with descending IDs breaking ties.
+    Offset pagination is not a snapshot: changes between requests may shift pages.
+    """
     query = select(Post).where(agent_post_access_filter(agent_email))
 
     # By default exclude archived and deleted posts.
@@ -532,7 +557,9 @@ async def list_posts(
 
     # Fetch page — pinned posts first, then by recency
     result = await db.execute(
-        query.order_by(Post.pinned.desc(), Post.pinned_at.desc(), Post.timestamp.desc())
+        query.order_by(
+            Post.pinned.desc(), Post.pinned_at.desc(), Post.timestamp.desc(), Post.id.desc()
+        )
         .offset(offset)
         .limit(limit)
     )
@@ -563,14 +590,21 @@ async def list_posts(
     return {"posts": summaries, "total": total, "limit": limit, "offset": offset}
 
 
-@router.get("/unread", response_model=PaginatedPosts)
+@router.get("/unread", response_model=PaginatedPosts, dependencies=[Depends(_reject_per_page)])
 async def list_unread_posts(
-    limit: int = Query(default=50, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100, description="Page size; default 50, maximum 100"),
+    offset: int = Query(default=0, ge=0, description="Posts to skip; use next_offset to continue"),
     agent_email: str = Depends(get_current_agent_or_session),
     db: AsyncSession = Depends(get_db),
 ) -> dict:  # type: ignore[type-arg]
-    """List readable posts the requesting agent has NOT yet read."""
+    """List readable posts the requesting agent has NOT yet read.
+
+    Returns one page, with limit=50 by default (maximum 100) and offset=0.
+    While has_more is true, request next_offset with the same limit.
+    next_offset is null when no further posts remain. per_page is unsupported (422).
+    Collect pages before reading post details: reading removes posts from this list
+    and shifts offsets. Other changes between requests may also shift pages.
+    """
     read_subquery = select(ReadLog.post_id).where(ReadLog.agent_email == agent_email)
     query = select(Post).where(
         Post.id.notin_(read_subquery),
@@ -581,7 +615,9 @@ async def list_unread_posts(
     total = count_result.scalar() or 0
 
     result = await db.execute(
-        query.order_by(Post.pinned.desc(), Post.pinned_at.desc(), Post.timestamp.desc())
+        query.order_by(
+            Post.pinned.desc(), Post.pinned_at.desc(), Post.timestamp.desc(), Post.id.desc()
+        )
         .offset(offset)
         .limit(limit)
     )
