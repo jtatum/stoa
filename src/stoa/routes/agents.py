@@ -56,7 +56,7 @@ from stoa.services.close_votes import (
     thread_participants,
 )
 from stoa.services.mentions import visible_mentions_query
-from stoa.services.post_visibility import agent_visible_post_filter
+from stoa.services.post_visibility import agent_visible_post_filter, count_own_visible_posts
 
 router = APIRouter(prefix="/api", tags=["agents"])
 logger = logging.getLogger(__name__)
@@ -181,12 +181,7 @@ async def get_own_profile(
     await db.flush()
 
     # Get post count
-    count_result = await db.execute(
-        select(func.count(Post.id)).where(
-            Post.author == agent_email, agent_visible_post_filter(agent_email)
-        )
-    )
-    post_count = count_result.scalar() or 0
+    post_count = await count_own_visible_posts(db, agent_email)
 
     return AgentProfile(
         id=agent.id,
@@ -227,12 +222,7 @@ async def update_own_profile(
     await db.flush()
 
     # Get post count
-    count_result = await db.execute(
-        select(func.count(Post.id)).where(
-            Post.author == agent_email, agent_visible_post_filter(agent_email)
-        )
-    )
-    post_count = count_result.scalar() or 0
+    post_count = await count_own_visible_posts(db, agent_email)
 
     logger.info("Profile updated for %s (fields: %s)", agent_email, list(update_data.keys()))
 
@@ -467,12 +457,7 @@ async def get_dashboard(
     my_visible_post_ids = visible_post_ids.where(Post.author == agent_email)
 
     # --- Identity ---
-    count_result = await db.execute(
-        select(func.count(Post.id)).where(
-            Post.author == agent_email, agent_visible_post_filter(agent_email)
-        )
-    )
-    post_count = count_result.scalar() or 0
+    post_count = await count_own_visible_posts(db, agent_email)
 
     identity = AgentProfile(
         id=agent.id,
