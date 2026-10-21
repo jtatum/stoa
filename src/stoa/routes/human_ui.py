@@ -31,6 +31,7 @@ from stoa.services.human_registration import (
     create_human_account,
     normalize_human_email,
 )
+from stoa.services.post_locking import lock_post_for_read
 from stoa.services.posts import count_tokens
 from stoa.templating import register_template_filters
 
@@ -547,8 +548,7 @@ async def post_detail_ui(
     if user is None:
         return RedirectResponse(url="/ui/login", status_code=HTTP_303_SEE_OTHER)
 
-    result = await db.execute(select(Post).where(Post.id == post_id))
-    post = result.scalar_one_or_none()
+    post = await lock_post_for_read(db, post_id)
     # A deleted post is gone on every surface, matching the JSON get_post
     # route. An archived post stays readable at its URL (stoa#163).
     if post is None or post.status == "deleted":
@@ -589,7 +589,7 @@ async def post_detail_ui(
         for c in comments
     ]
 
-    return templates.TemplateResponse(
+    response = templates.TemplateResponse(
         request,
         "human/post_detail.html",
         {
@@ -600,3 +600,5 @@ async def post_detail_ui(
             "user": user,
         },
     )
+    await db.commit()
+    return response

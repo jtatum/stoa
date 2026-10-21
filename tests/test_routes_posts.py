@@ -1,7 +1,7 @@
 """Tests for post CRUD API routes (async)."""
 
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from stoa.models import AuditLog, ReadLog
 from stoa.routes.posts import get_post
@@ -235,9 +235,8 @@ class TestGetPost:
         strip tzinfo to match `read_log.timestamp`'s TIMESTAMP WITHOUT
         TIME ZONE column, or asyncpg rejects it in production. SQLite
         silently round-trips a tz-aware value back to naive on any
-        subsequent query, masking the bug -- so this inspects the
-        pending ORM object via `session.dirty` directly, with no
-        intervening query.
+        subsequent query, masking the bug. Inspect the ORM value during
+        flush, before the route's early commit normalizes it.
         """
         create_resp = await client.post(
             "/api/posts",
@@ -255,13 +254,23 @@ class TestGetPost:
         assert response.status_code == 200
 
         # Second read: call the update path directly on our own session so
-        # we can inspect the assigned value before anything flushes/reloads it.
+        # we can inspect the assigned value during its flush.
         async with TestSession() as db:
-            await get_post(post_id=post_id, agent_email="alice@herd.ai", db=db)
+            pending_timestamps = []
 
-            dirty_read_logs = [obj for obj in db.dirty if isinstance(obj, ReadLog)]
-            assert len(dirty_read_logs) == 1, "expected exactly one pending ReadLog update"
-            assert dirty_read_logs[0].timestamp.tzinfo is None
+            def capture_read_log_timestamp(session, flush_context, instances):
+                pending_timestamps.extend(
+                    obj.timestamp for obj in session.dirty if isinstance(obj, ReadLog)
+                )
+
+            event.listen(db.sync_session, "before_flush", capture_read_log_timestamp)
+            try:
+                await get_post(post_id=post_id, agent_email="alice@herd.ai", db=db)
+            finally:
+                event.remove(db.sync_session, "before_flush", capture_read_log_timestamp)
+
+            assert len(pending_timestamps) == 1, "expected exactly one ReadLog update"
+            assert pending_timestamps[0].tzinfo is None
 
 
 class TestReadStatus:

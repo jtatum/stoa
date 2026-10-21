@@ -128,11 +128,13 @@ async def post_detail_page(
 
     async with async_session_factory() as db:
         result = await db.execute(
-            select(Post).where(
+            select(Post)
+            .where(
                 Post.id == post_id,
                 Post.status != "deleted",
                 agent_post_access_filter(agent_email),
             )
+            .with_for_update(read=True)
         )
         post = result.scalar_one_or_none()
         if post is None:

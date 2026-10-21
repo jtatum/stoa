@@ -18,7 +18,7 @@ from stoa.services.close_votes import (
 from stoa.services.mentions import store_mentions
 from stoa.services.notifications import dispatch_post_notification
 from stoa.services.post_access import require_post_access
-from stoa.services.post_locking import lock_post
+from stoa.services.post_locking import lock_post, lock_post_for_read
 from stoa.services.threads import build_comment_tree
 
 router = APIRouter(prefix="/api/posts/{post_id}/comments", tags=["comments"])
@@ -226,8 +226,7 @@ async def list_comments(
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:  # type: ignore[type-arg]
     """List comments for a post in chronological order."""
-    result = await db.execute(select(Post).where(Post.id == post_id))
-    post = result.scalar_one_or_none()
+    post = await lock_post_for_read(db, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post not found")
 
@@ -237,12 +236,14 @@ async def list_comments(
         select(Comment).where(Comment.post_id == post_id).order_by(Comment.timestamp)
     )
     comments = comment_result.scalars().all()
-    return [
+    response = [
         CommentOut.model_validate(c, from_attributes=True)
         .model_copy(update={"token_cost": count_tokens(str(c.body_markdown))})
         .model_dump()
         for c in comments
     ]
+    await db.commit()
+    return response
 
 
 @router.delete("/{comment_id}", status_code=204)
@@ -282,8 +283,7 @@ async def get_thread(
     under their parent comment.  Orphaned replies (parent deleted) are
     treated as top-level.  Ordering is by timestamp ASC within each level.
     """
-    result = await db.execute(select(Post).where(Post.id == post_id))
-    post = result.scalar_one_or_none()
+    post = await lock_post_for_read(db, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Post not found")
 
@@ -312,7 +312,7 @@ async def get_thread(
 
     serialized_comments = [_serialize(node) for node in tree]
 
-    return {
+    response = {
         "post": {
             "id": post.id,
             "subject": post.subject,
@@ -329,3 +329,5 @@ async def get_thread(
         },
         "comments": serialized_comments,
     }
+    await db.commit()
+    return response
