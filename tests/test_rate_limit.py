@@ -504,6 +504,39 @@ class TestBrowserRequesterBudget:
                 assert response.headers["X-RequesterRateLimit-Remaining"] == str(remaining)
             assert (await client.get("/web/posts")).status_code == 429
 
+    @pytest.mark.parametrize("path", ["/web/posts", "/api/agents/me"])
+    async def test_logout_clears_cookie_when_requester_budget_is_exhausted(
+        self, client: AsyncClient, path: str
+    ) -> None:
+        client.base_url = "https://test"
+        requester_limiter = RateLimiter(max_requests=2, window_seconds=60)
+        with (
+            patch("stoa.rate_limit._requester_limiter", requester_limiter),
+            patch("stoa.routes.web.async_session_factory", TestSession),
+        ):
+            response = await client.post("/web/login", data={"api_key": "alice-key"})
+            assert response.status_code == 303
+            assert client.cookies["stoa_session"] == "alice-key"
+
+            response = await client.get(path, headers=HEADERS if path.startswith("/api/") else {})
+            assert response.status_code == 200
+            assert response.headers["X-RequesterRateLimit-Remaining"] == "0"
+            assert (await client.get("/web/posts")).status_code == 429
+
+            response = await client.post(
+                "/web/logout", headers={"Origin": "https://attacker.example"}
+            )
+            assert response.status_code == 403
+            assert client.cookies["stoa_session"] == "alice-key"
+
+            response = await client.post("/web/logout")
+            assert response.status_code == 303
+            assert response.headers["Location"] == "/web/login"
+            assert "Max-Age=0" in response.headers["Set-Cookie"]
+            assert "stoa_session" not in client.cookies
+            assert (await client.get("/web/login")).status_code == 200
+            assert (await client.get("/api/agents/me", headers=HEADERS)).status_code == 429
+
     @pytest.mark.parametrize(
         ("path", "cookie", "status"),
         [

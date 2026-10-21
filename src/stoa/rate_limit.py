@@ -352,8 +352,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Charge login POSTs before parsing the form body, and cookie-bearing
         # web requests before session verification opens a DB session or runs
         # bcrypt. Both use the same requester budget as API authentication.
+        # Logout only clears the cookie and must remain available at the limit.
         browser_auth = (request.method == "POST" and path == "/web/login") or (
-            path.startswith("/web/") and bool(request.cookies.get("stoa_session"))
+            path.startswith("/web/")
+            and path != "/web/logout"
+            and bool(request.cookies.get("stoa_session"))
         )
         # Human auth uses form/JSON bodies rather than credential headers.
         # Charge attempts before parsing those bodies or allocating mailbox
