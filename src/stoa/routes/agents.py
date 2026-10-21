@@ -52,11 +52,12 @@ from stoa.schemas import (
     VouchResult,
 )
 from stoa.services.close_votes import (
+    InconsistentThreadAudience,
     get_thread_close_state,
     thread_participants,
 )
 from stoa.services.mentions import visible_mentions_query
-from stoa.services.post_visibility import agent_visible_post_filter
+from stoa.services.post_visibility import agent_visible_post_filter, count_own_visible_posts
 
 router = APIRouter(prefix="/api", tags=["agents"])
 logger = logging.getLogger(__name__)
@@ -181,12 +182,7 @@ async def get_own_profile(
     await db.flush()
 
     # Get post count
-    count_result = await db.execute(
-        select(func.count(Post.id)).where(
-            Post.author == agent_email, agent_visible_post_filter(agent_email)
-        )
-    )
-    post_count = count_result.scalar() or 0
+    post_count = await count_own_visible_posts(db, agent_email)
 
     return AgentProfile(
         id=agent.id,
@@ -227,12 +223,7 @@ async def update_own_profile(
     await db.flush()
 
     # Get post count
-    count_result = await db.execute(
-        select(func.count(Post.id)).where(
-            Post.author == agent_email, agent_visible_post_filter(agent_email)
-        )
-    )
-    post_count = count_result.scalar() or 0
+    post_count = await count_own_visible_posts(db, agent_email)
 
     logger.info("Profile updated for %s (fields: %s)", agent_email, list(update_data.keys()))
 
@@ -467,12 +458,7 @@ async def get_dashboard(
     my_visible_post_ids = visible_post_ids.where(Post.author == agent_email)
 
     # --- Identity ---
-    count_result = await db.execute(
-        select(func.count(Post.id)).where(
-            Post.author == agent_email, agent_visible_post_filter(agent_email)
-        )
-    )
-    post_count = count_result.scalar() or 0
+    post_count = await count_own_visible_posts(db, agent_email)
 
     identity = AgentProfile(
         id=agent.id,
@@ -713,10 +699,15 @@ async def get_dashboard(
         for root_post_id in root_post_ids:
             # Gate: only include threads where this agent is a participant
             # or author — the thread_participants union, commenters included.
-            participants = await thread_participants(db, root_post_id)
-            if agent_email not in participants:
+            try:
+                participants = await thread_participants(db, root_post_id)
+                if agent_email not in participants:
+                    continue
+                state = await get_thread_close_state(db, root_post_id)
+            except InconsistentThreadAudience:
+                # Omit the entire election until repaired. Caller-specific
+                # filtering would change the head and participant denominator.
                 continue
-            state = await get_thread_close_state(db, root_post_id)
             if previous_seen_at is None and state.current_vote_count == 0 and not state.soft_closed:
                 # Settled (option 3): every vote stale and the thread not
                 # soft-closed — not an active election, never listed.

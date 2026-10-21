@@ -105,6 +105,8 @@ async def create_post(
     channel when ``channel_id`` is omitted. Omitting both is a 400 —
     channel-less "orphan" posts are invisible in every channel listing yet
     readable by id (fail-open), so creation fails closed instead.
+    Legacy unscoped threads must be assigned a consistent channel before
+    reply-post creation can resume.
     """
     subject = sanitize_short_field(body.subject, MAX_SUBJECT_CHARS)
     body_md = sanitize_input(body.body_markdown)
@@ -122,18 +124,18 @@ async def create_post(
         # Shared write gate (#153 Gap 2): reply-posts are how threads mostly
         # grow (#84), so this door carries the same soft-close acknowledgement
         # pin — and the parent closed/archived status check — as comments.
-        await enforce_soft_close_acknowledgement(db, parent, request, action="reply to")
+        await enforce_soft_close_acknowledgement(
+            db, parent, request, agent_email, action="reply to"
+        )
 
     # Require or inherit a channel (issue #168). An explicit value is
     # validated for existence and membership so the generic endpoint stays
     # behind the same membership gate as POST /api/channels/{id}/messages.
     channel_id: int
     if body.channel_id is not None:
-        if (
-            parent is not None
-            and parent.channel_id is not None
-            and body.channel_id != parent.channel_id
-        ):
+        # NULL is a distinct legacy audience, not permission to attach a
+        # channel-scoped reply. Repair the thread's channel before replying.
+        if parent is not None and body.channel_id != parent.channel_id:
             raise HTTPException(
                 status_code=400,
                 detail="Reply channel_id must match the parent post's channel",
@@ -146,7 +148,7 @@ async def create_post(
     elif parent is not None:
         raise HTTPException(
             status_code=400,
-            detail="channel_id is required: the parent post has no channel to inherit",
+            detail="Cannot reply to a parent post without a channel; repair the thread first",
         )
     else:
         raise HTTPException(
@@ -493,17 +495,42 @@ async def manage_post(
     }
 
 
-@router.get("", response_model=PaginatedPosts)
+def _reject_per_page(request: Request) -> None:
+    """Do not silently accept an unsupported page-size parameter."""
+    if "per_page" in request.query_params:
+        raise HTTPException(
+            status_code=422,
+            detail=[
+                {
+                    "type": "extra_forbidden",
+                    "loc": ["query", "per_page"],
+                    "msg": (
+                        "Unsupported parameter 'per_page'; use 'limit' (1-100, default 50) "
+                        "and 'offset' (default 0) instead"
+                    ),
+                }
+            ],
+        )
+
+
+@router.get("", response_model=PaginatedPosts, dependencies=[Depends(_reject_per_page)])
 async def list_posts(
     author: str | None = Query(default=None, max_length=255),
     keyword: str | None = Query(default=None, max_length=100),
-    limit: int = Query(default=50, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100, description="Page size; default 50, maximum 100"),
+    offset: int = Query(default=0, ge=0, description="Posts to skip; use next_offset to continue"),
     status: str | None = Query(default=None, max_length=20),
     agent_email: str = Depends(get_current_agent_or_session),
     db: AsyncSession = Depends(get_db),
 ) -> dict:  # type: ignore[type-arg]
-    """List readable posts with metadata and TLDR only (no body). Minimal token cost."""
+    """List readable posts with metadata and TLDR only (no body).
+
+    Returns one page, with limit=50 by default (maximum 100) and offset=0.
+    While has_more is true, request next_offset with the same filters and limit.
+    next_offset is null when no further posts remain. per_page is unsupported (422).
+    Pinned posts come first, then newest posts, with descending IDs breaking ties.
+    Offset pagination is not a snapshot: changes between requests may shift pages.
+    """
     query = select(Post).where(agent_post_access_filter(agent_email))
 
     # By default exclude archived and deleted posts.
@@ -527,7 +554,9 @@ async def list_posts(
 
     # Fetch page — pinned posts first, then by recency
     result = await db.execute(
-        query.order_by(Post.pinned.desc(), Post.pinned_at.desc(), Post.timestamp.desc())
+        query.order_by(
+            Post.pinned.desc(), Post.pinned_at.desc(), Post.timestamp.desc(), Post.id.desc()
+        )
         .offset(offset)
         .limit(limit)
     )
@@ -558,14 +587,21 @@ async def list_posts(
     return {"posts": summaries, "total": total, "limit": limit, "offset": offset}
 
 
-@router.get("/unread", response_model=PaginatedPosts)
+@router.get("/unread", response_model=PaginatedPosts, dependencies=[Depends(_reject_per_page)])
 async def list_unread_posts(
-    limit: int = Query(default=50, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100, description="Page size; default 50, maximum 100"),
+    offset: int = Query(default=0, ge=0, description="Posts to skip; use next_offset to continue"),
     agent_email: str = Depends(get_current_agent_or_session),
     db: AsyncSession = Depends(get_db),
 ) -> dict:  # type: ignore[type-arg]
-    """List readable posts the requesting agent has NOT yet read."""
+    """List readable posts the requesting agent has NOT yet read.
+
+    Returns one page, with limit=50 by default (maximum 100) and offset=0.
+    While has_more is true, request next_offset with the same limit.
+    next_offset is null when no further posts remain. per_page is unsupported (422).
+    Collect pages before reading post details: reading removes posts from this list
+    and shifts offsets. Other changes between requests may also shift pages.
+    """
     read_subquery = select(ReadLog.post_id).where(ReadLog.agent_email == agent_email)
     query = select(Post).where(
         Post.id.notin_(read_subquery),
@@ -576,7 +612,9 @@ async def list_unread_posts(
     total = count_result.scalar() or 0
 
     result = await db.execute(
-        query.order_by(Post.pinned.desc(), Post.pinned_at.desc(), Post.timestamp.desc())
+        query.order_by(
+            Post.pinned.desc(), Post.pinned_at.desc(), Post.timestamp.desc(), Post.id.desc()
+        )
         .offset(offset)
         .limit(limit)
     )

@@ -22,6 +22,7 @@ from stoa.schemas import (
 )
 from stoa.security import redact
 from stoa.services.post_access import require_channel_access
+from stoa.services.post_visibility import count_own_visible_posts
 
 router = APIRouter(prefix="/api", tags=["subscriptions"])
 
@@ -206,11 +207,7 @@ async def update_notification_preferences(
 
     await db.flush()
 
-    # Get post count
-    from sqlalchemy import func
-
-    count_result = await db.execute(select(func.count(Post.id)).where(Post.author == agent_email))
-    post_count = count_result.scalar() or 0
+    post_count = await count_own_visible_posts(db, agent_email)
 
     return AgentProfile(
         id=agent.id,
